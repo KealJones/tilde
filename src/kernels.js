@@ -725,62 +725,64 @@ struct P { rows: u32, K: u32, T: u32, dOff: u32, yStride: u32, yOff: u32, xStrid
 @group(0) @binding(1) var<storage, read> W: array<u32>;
 @group(0) @binding(2) var<storage, read> X: array<f32>;
 @group(0) @binding(3) var<storage, read_write> Y: array<f32>;
-var<workgroup> Ws: array<vec4<f32>, 512>; // [32 k][16 × 4 rows]
-var<workgroup> Xs: array<vec4<f32>, 512>; // [32 k][16 × 4 tokens]
+// Half a Q4_0 block (16 k) at a time, as scalars: 8 KB of workgroup memory. The first version kept a whole block in
+// vec4s (16 KB, exactly the default limit) with each vec4 filled one component per thread, and an iPhone 16 (Safari
+// 27.2) gave all zeros for it while SwiftShader matched (bench/kernel-check.html, Nov 21 2026).
+var<workgroup> Ws: array<f32, 1024>; // [16 k][64 rows]
+var<workgroup> Xs: array<f32, 1024>; // [16 k][64 tokens]
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let row0 = wid.x * 64u;
   let tok0 = wid.y * 64u;
   let nb = p.K / 32u;
   let tr = li / 16u; let tc = li % 16u; // this thread's rows tr·4.., tokens tc·4..
-  var acc: array<vec4<f32>, 4>;          // acc[i] = row tr·4+i, tokens tc·4..tc·4+3
-  // Loader roles: W: row lr, word lq (8 values) of its block. X: token xt, values xk..xk+7.
+  var a0 = vec4<f32>(0.0); var a1 = vec4<f32>(0.0); var a2 = vec4<f32>(0.0); var a3 = vec4<f32>(0.0); // rows tr·4+0..3
+  // Loader roles: W: row lr, word lq of its block (4 low nibbles: k = lq·4..+3; 4 high: k + 16). X: token xt, 4 values.
   let lr = li / 4u; let lq = li % 4u;
   let lrow = row0 + lr;
-  let xt = li / 4u; let xk = (li % 4u) * 8u;
+  let xt = li / 4u; let xk = (li % 4u) * 4u;
   let xtok = tok0 + xt;
   for (var b = 0u; b < nb; b++) {
-    var w8 = array<f32, 8>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    var lo = vec4<f32>(0.0); var hi = vec4<f32>(0.0);
     if (lrow < p.rows) {
       let blk = lrow * nb + b;
       let dw = W[p.dOff + (blk >> 1u)];
       let d = select(unpack2x16float(dw).x, unpack2x16float(dw).y, (blk & 1u) == 1u);
       let q = W[blk * 4u + lq];
-      for (var j = 0u; j < 4u; j++) {
-        let byte = (q >> (j * 8u)) & 0xffu;
-        w8[j] = (f32(byte & 15u) - 8.0) * d;
-        w8[j + 4u] = (f32(byte >> 4u) - 8.0) * d;
+      let b0 = q & 0xffu; let b1 = (q >> 8u) & 0xffu; let b2 = (q >> 16u) & 0xffu; let b3 = q >> 24u;
+      lo = (vec4<f32>(f32(b0 & 15u), f32(b1 & 15u), f32(b2 & 15u), f32(b3 & 15u)) - 8.0) * d;
+      hi = (vec4<f32>(f32(b0 >> 4u), f32(b1 >> 4u), f32(b2 >> 4u), f32(b3 >> 4u)) - 8.0) * d;
+    }
+    for (var half = 0u; half < 2u; half++) {
+      let w4 = select(lo, hi, half == 1u);
+      Ws[(lq * 4u + 0u) * 64u + lr] = w4.x;
+      Ws[(lq * 4u + 1u) * 64u + lr] = w4.y;
+      Ws[(lq * 4u + 2u) * 64u + lr] = w4.z;
+      Ws[(lq * 4u + 3u) * 64u + lr] = w4.w;
+      let xb = xtok * p.xStride + b * 32u + half * 16u + xk;
+      let ok = xtok < p.T;
+      Xs[(xk + 0u) * 64u + xt] = select(0.0, X[min(xb + 0u, arrayLength(&X) - 1u)], ok);
+      Xs[(xk + 1u) * 64u + xt] = select(0.0, X[min(xb + 1u, arrayLength(&X) - 1u)], ok);
+      Xs[(xk + 2u) * 64u + xt] = select(0.0, X[min(xb + 2u, arrayLength(&X) - 1u)], ok);
+      Xs[(xk + 3u) * 64u + xt] = select(0.0, X[min(xb + 3u, arrayLength(&X) - 1u)], ok);
+      workgroupBarrier();
+      for (var k = 0u; k < 16u; k++) {
+        let wb = k * 64u + tr * 4u; let xo = k * 64u + tc * 4u;
+        let x = vec4<f32>(Xs[xo], Xs[xo + 1u], Xs[xo + 2u], Xs[xo + 3u]);
+        a0 += Ws[wb] * x; a1 += Ws[wb + 1u] * x; a2 += Ws[wb + 2u] * x; a3 += Ws[wb + 3u] * x;
       }
-    }
-    // Byte j of word lq holds k = lq·4 + j (low nibble) and k = lq·4 + j + 16 (high nibble).
-    for (var j = 0u; j < 4u; j++) {
-      Ws[(lq * 4u + j) * 16u + lr / 4u][lr % 4u] = w8[j];
-      Ws[(lq * 4u + j + 16u) * 16u + lr / 4u][lr % 4u] = w8[j + 4u];
-    }
-    for (var j = 0u; j < 8u; j++) {
-      let k = xk + j;
-      Xs[k * 16u + xt / 4u][xt % 4u] = select(0.0, X[xtok * p.xStride + b * 32u + k], xtok < p.T);
-    }
-    workgroupBarrier();
-    for (var k = 0u; k < 32u; k++) {
-      let w = Ws[k * 16u + tr];
-      let x = Xs[k * 16u + tc];
-      acc[0] += w.x * x;
-      acc[1] += w.y * x;
-      acc[2] += w.z * x;
-      acc[3] += w.w * x;
-    }
-    workgroupBarrier();
-  }
-  for (var i = 0u; i < 4u; i++) {
-    let row = row0 + tr * 4u + i;
-    if (row < p.rows) {
-      for (var j = 0u; j < 4u; j++) {
-        let tok = tok0 + tc * 4u + j;
-        if (tok < p.T) { Y[tok * p.yStride + p.yOff + row] = acc[i][j]; }
-      }
+      workgroupBarrier();
     }
   }
+  let r = row0 + tr * 4u; let t = tok0 + tc * 4u;
+  put(r, t, a0); put(r + 1u, t, a1); put(r + 2u, t, a2); put(r + 3u, t, a3);
+}
+fn put(row: u32, t: u32, v: vec4<f32>) {
+  if (row >= p.rows) { return; }
+  if (t < p.T) { Y[t * p.yStride + p.yOff + row] = v.x; }
+  if (t + 1u < p.T) { Y[(t + 1u) * p.yStride + p.yOff + row] = v.y; }
+  if (t + 2u < p.T) { Y[(t + 2u) * p.yStride + p.yOff + row] = v.z; }
+  if (t + 3u < p.T) { Y[(t + 3u) * p.yStride + p.yOff + row] = v.w; }
 }`;
 
 /**

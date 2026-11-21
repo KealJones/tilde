@@ -132,6 +132,9 @@ async function flashCase(gpu, H, KVH, gated, T, pos0, slots, window = 0xffffffff
 
 try {
   const gpu = await openGpu();
+  // A shader the browser refuses (compile, validation, limits) otherwise only shows up as zeros in the results.
+  gpu.device.addEventListener('uncapturederror', (e) => log('GPU error:', e.error && e.error.message));
+  log('limits: workgroup storage', gpu.device.limits.maxComputeWorkgroupStorageSize, 'invocations', gpu.device.limits.maxComputeInvocationsPerWorkgroup, '·', navigator.userAgent);
   let ok = true;
   const only = new URLSearchParams(location.search).get('only'); // ?only=matvec|flash
   if (only !== 'flash') for (const [r, k] of [[8, 32], [13, 2048], [300, 7680], [33000, 64]]) ok = (await matvecCase(gpu, r, k)) && ok;
