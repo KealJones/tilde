@@ -29,6 +29,11 @@ GitHub Pages serves the `gh-pages` branch: `.github/workflows/deploy.yml` copies
 through the phone relay at `/tilde/pr-preview/pr-<n>/…`). Bigger or riskier changes go in a PR so they can be tried
 on the phone first.
 
+Each PR also runs `bench/kernel-check.html` on a real iPhone in BrowserStack (`tools/iphone-kernel-check.mjs`, the
+`iphone-kernel-check` job in pr-preview.yml; needs the `BROWSERSTACK_USERNAME` / `BROWSERSTACK_ACCESS_KEY` secrets,
+skipped without them). SwiftShader passed 735b0d2's `gemmQ4_0x64`, which gave all zeros on iPhones; the cloud iPhone
+fails it the same way the real one did (checked Nov 22, 2026). About a minute of BrowserStack time per run.
+
 ## Checking against llama.cpp
 
 `bench/lfm3-check.html` runs a prompt through Tilde and compares the last-position logits and a greedy
