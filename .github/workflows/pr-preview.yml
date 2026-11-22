@@ -28,7 +28,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Copy the site
         if: github.event.action != 'closed'
-        run: mkdir _site && git archive HEAD | tar -x -C _site && rm -rf _site/.github
+        run: |
+          mkdir _site && git archive HEAD | tar -x -C _site && rm -rf _site/.github
+          echo "${{ github.event.pull_request.head.sha }}" > _site/version.txt
       - name: Publish or remove the preview
         uses: rossjrw/pr-preview-action@v1
         with:
@@ -37,3 +39,29 @@ jobs:
           umbrella-dir: pr-preview
           pages-base-url: kealjones.com/tilde
           action: auto
+
+  # bench/kernel-check.html on a real iPhone (BrowserStack), against this PR's preview. SwiftShader in CI passed a
+  # kernel that gave all zeros on iPhones; only an Apple GPU catches that. Skipped when the secrets aren't set.
+  iphone-kernel-check:
+    needs: preview
+    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+      BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+      PREVIEW: https://kealjones.com/tilde/pr-preview/pr-${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.BROWSERSTACK_ACCESS_KEY != ''
+      - name: Wait for GitHub Pages to serve this commit
+        if: env.BROWSERSTACK_ACCESS_KEY != ''
+        run: |
+          for i in $(seq 1 60); do
+            [ "$(curl -fs "$PREVIEW/version.txt?$i" | tr -d '[:space:]')" = "${{ github.event.pull_request.head.sha }}" ] && exit 0
+            sleep 10
+          done
+          echo "The preview never showed this commit"; exit 1
+      - name: kernel-check on an iPhone
+        if: env.BROWSERSTACK_ACCESS_KEY != ''
+        run: node tools/iphone-kernel-check.mjs "$PREVIEW/bench/kernel-check.html"
