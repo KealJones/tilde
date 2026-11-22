@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilde black box: crash, size down, carry on</title>
+<style>
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 16px; max-width: 640px; color: #222; background: #fff; }
+  @media (prefers-color-scheme: dark) { body { color: #ddd; background: #111; } .box { border-color: #444 !important; } }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .mute { color: #888; font-size: 13px; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid #888; background: none; color: inherit; margin: 4px 6px 4px 0; }
+  button.go { background: #2a6; border-color: #2a6; color: #fff; }
+  .box { border: 1px solid #ccc; border-radius: 10px; padding: 10px 12px; margin: 12px 0; }
+  #log { white-space: pre-wrap; font: 12px/1.45 ui-monospace, Menlo, monospace; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 3px 6px 3px 0; vertical-align: top; }
+  td:first-child { color: #888; white-space: nowrap; }
+</style>
+<h1>Crash, size down, carry on</h1>
+<p class="mute">Loads a model with a context that's too big for this phone, with Tilde's black box on. If iOS kills the
+tab, Safari reloads the page; the page picks up where it was, Tilde reads its record of the crash, loads at a size
+that fits, and finishes the test. Keep the screen on and this tab in front (a kill while hidden doesn't count).</p>
+<p>
+  <label>Model <select id="model"><option value="qwen3">Qwen3 0.6B</option><option value="lfm3">LFM3 1.7B</option></select></label>
+  <label>Context <select id="ctx"><option>16384</option><option>32768</option><option>8192</option><option>4096</option></select></label>
+</p>
+<p><button class="go" id="start">Start (forgets earlier crashes)</button><button id="again">Run again (keeps them)</button><button id="awake" hidden>Keep screen on</button></p>
+<div class="box" id="summary">Not run yet.</div>
+<div class="box"><div id="log"></div></div>
+<script>
+// The phone relay's agent (KealJones/phone-relay), only when asked for with ?relay=.
+(() => {
+  const r = new URLSearchParams(location.search).get('relay');
+  try { const u = new URL(r); if (u.origin === 'https://phone-relay.kealjones.workers.dev' && u.pathname === '/agent.js') { const s = document.createElement('script'); s.src = u.href; document.head.append(s); } } catch {}
+})();
+</script>
+<script type="module">
+// State lives in localStorage so it survives the tab being killed: a test still marked running when the page loads
+// is one the last page didn't finish, so it carries on with the next attempt.
+const HF = 'https://huggingface.co/';
+const MODELS = {
+  qwen3: { name: 'Qwen3 0.6B', gguf: HF + 'ggml-org/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_0.gguf' },
+  lfm3: { name: 'LFM3 1.7B', gguf: HF + 'LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-QAD-Q4_0.gguf' },
+};
+const KEY = 'tilde:bbdemo';
+const MAX_ATTEMPTS = 4;
+const PROMPT_TOKENS = 256;
+const GEN = Number(new URLSearchParams(location.search).get('gen')) || 64;
+const TEXT = 'The tide comes in twice a day, pulled by the moon and, more weakly, by the sun. Sailors learned to read it long before anyone could explain it, and harbours were built around its rhythm. ';
+const $ = (id) => document.getElementById(id);
+const qs = new URLSearchParams(location.search);
+const now = () => Date.now();
+
+let st = load();
+function load() { try { return JSON.parse(localStorage.getItem(KEY)) || null; } catch { return null; } }
+function save() { try { localStorage.setItem(KEY, JSON.stringify(st)); } catch {} }
+function log(msg) { st.log.push([now(), msg]); save(); render(); console.log(msg); }
+
+function render() {
+  if (!st) { $('summary').textContent = 'Not run yet.'; $('log').textContent = ''; return; }
+  const t0 = st.log[0]?.[0] || now();
+  $('log').textContent = st.log.map(([t, m]) => `${((t - t0) / 1000).toFixed(1).padStart(6)} s  ${m}`).join('\n');
+  const r = st.result;
+  const rows = [
+    ['Model', `${MODELS[st.model].name}, asked for a ${st.ctx}-token context`],
+    ['Status', st.phase === 'done' ? (r ? 'finished' : 'stopped') : `running, attempt ${st.attempt}`],
+    ['Crashes', String(st.crashes.length) + (st.crashes.length ? ' — ' + st.crashes.map((c) => `attempt ${c.attempt}: ${c.verdict} during ${c.stage || '?'}${c.mb ? ` at ${c.mb} MB` : ''}, back in ${c.backS} s`).join('; ') : '')],
+  ];
+  if (r) rows.push(
+    ['Ran with', `a ${r.ctx}-token context, ${r.maxChunk}-token chunks` + (r.ctx !== st.ctx ? ' (sized down by the black box)' : '')],
+    ['GPU memory', `${r.mb} MB` + (r.capMB ? ` (cap ${r.capMB} MB)` : '')],
+    ['Read', `${r.read} tok/s (${r.promptTokens} tokens)`], ['Write', `${r.write} tok/s (${r.wrote} tokens)`],
+  );
+  if (st.error) rows.push(['Error', st.error]);
+  $('summary').innerHTML = '<table>' + rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('') + '</table>';
+  $('start').disabled = $('again').disabled = st.phase !== 'done';
+}
+
+function start(forget) {
+  if (forget) for (const k of Object.keys(localStorage)) if (k.startsWith('tilde:blackbox:')) localStorage.removeItem(k);
+  st = { model: $('model').value, ctx: Number($('ctx').value), phase: 'running', attempt: 0, crashes: [], log: [], result: null };
+  log(forget ? 'started; Tilde\'s crash records cleared' : 'started; keeping Tilde\'s crash records');
+  keepAwake();
+  attempt();
+}
+
+async function attempt() {
+  st.attempt++;
+  if (st.attempt > MAX_ATTEMPTS) { st.phase = 'done'; st.error = `gave up after ${MAX_ATTEMPTS} attempts`; log(st.error); return; }
+  st.lastSeen = now(); save();
+  const m = { ...MODELS[st.model], gguf: qs.get('gguf') || MODELS[st.model].gguf }; // ?gguf= for local testing
+  try {
+    log(`attempt ${st.attempt}: loading ${m.name}, asking for ${st.ctx} tokens`);
+    const { Tilde } = await import('../src/index.js');
+    const llm = await Tilde.load(m.gguf, { ctx: st.ctx });
+    const bb = llm.blackbox.report();
+    if (st.attempt > 1 || bb.verdict !== 'none') log(`black box: last session ${bb.verdict}` + (bb.previous?.mb ? ` at ${bb.previous.mb} MB during ${bb.previous.stage}` : '') + (bb.levels.capMB != null ? `; cap ${bb.levels.capMB} MB` : ''));
+    log(`loaded with a ${llm.model.ctx}-token context, ${llm.model.maxChunk}-token chunks, ${llm.stats().totalMB} MB`);
+    log('warm-up');
+    await llm.generate('Hi', { maxTokens: 2, temperature: 0, repeatPenalty: 1 });
+    let text = TEXT; while (llm.tokenizer.encode(text).length < PROMPT_TOKENS) text += TEXT;
+    const ids = llm.tokenizer.encode(text).slice(0, PROMPT_TOKENS);
+    log(`reading ${ids.length} tokens, then writing ${GEN}`);
+    const t0 = performance.now(); let tRead = 0, wrote = 0;
+    await llm.generate(ids, { maxTokens: GEN, temperature: 0, repeatPenalty: 1, onRead: () => { tRead = performance.now(); }, onToken: () => { wrote++; } });
+    const tEnd = performance.now();
+    st.result = {
+      ctx: llm.model.ctx, maxChunk: llm.model.maxChunk, mb: llm.stats().peakMB, capMB: bb.levels.capMB,
+      promptTokens: ids.length, read: Math.round(ids.length / ((tRead - t0) / 1000)), wrote, write: +(wrote / ((tEnd - tRead) / 1000)).toFixed(1),
+    };
+    st.phase = 'done';
+    log(`done: read ${st.result.read} tok/s, wrote ${st.result.write} tok/s, ${st.result.mb} MB`);
+  } catch (e) {
+    st.phase = 'done'; st.error = String(e.message || e); log('error: ' + st.error);
+  }
+  window.__result = { ok: !!st.result, ...st };
+}
+
+// A page load with a test still running: the last page was killed (or left) mid-attempt. Carry on.
+function resume() {
+  const back = Math.round((now() - (st.log.at(-1)?.[0] || now())) / 1000);
+  let rec = null;
+  try { rec = JSON.parse(localStorage.getItem('tilde:blackbox:' + (qs.get('gguf') || MODELS[st.model].gguf)) || 'null'); } catch {}
+  const s = rec?.session || {};
+  const verdict = s.closed ? 'left the page' : document.wasDiscarded ? 'discarded by iOS' : s.hidden ? 'killed while hidden' : 'killed';
+  st.crashes.push({ attempt: st.attempt, verdict, stage: s.stage, mb: s.mb, backS: back });
+  log(`attempt ${st.attempt} ended: ${verdict}` + (s.stage ? ` during ${s.stage}` : '') + (s.mb ? ` at ${s.mb} MB` : '') + `; page back after ${back} s`);
+  attempt();
+}
+
+let wake = null;
+async function keepAwake() {
+  if (!navigator.wakeLock || document.hidden || (wake && !wake.released)) return showAwake();
+  try { wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', showAwake); } catch {}
+  showAwake();
+}
+function showAwake() { $('awake').hidden = !navigator.wakeLock || !!(wake && !wake.released) || !st || st.phase === 'done'; }
+document.addEventListener('visibilitychange', () => { if (!document.hidden && st?.phase === 'running') keepAwake(); });
+
+$('start').onclick = () => start(true);
+$('again').onclick = () => start(false);
+$('awake').onclick = keepAwake;
+for (const [k, el] of [['model', $('model')], ['ctx', $('ctx')]]) if (qs.get(k)) el.value = qs.get(k);
+window.__demo = { get state() { return st; } };
+if (st?.phase === 'running') { render(); keepAwake(); resume(); }
+else if (qs.get('run') === '1') { qs.delete('run'); history.replaceState(null, '', location.pathname + (qs.size ? '?' + qs : '')); start(true); }
+else render();
+</script>
+</html>

@@ -4,6 +4,7 @@
 //   const text = await llm.chat([{ role: 'user', content: 'hi' }], { onToken: (t) => print(t) });
 
 import { openGpu } from './gpu.js';
+import { BlackBox } from './blackbox.js';
 import { httpSource } from './gguf.js';
 import { Tokenizer } from './tokenizer.js';
 import { cachedSource, clearCache, cacheFile, cachedFileInfo, removeCachedFile } from './cache.js';
@@ -36,23 +37,41 @@ export class Tilde {
    * @param {string | import('./gguf.js').ByteSource} source URL or byte source
    * @param {{ ctx?: number, chunk?: number, maxChunk?: number, submitBudgetMs?: number, cache?: boolean,
    *   gpu?: import('./gpu.js').Gpu, onProgress?: Function, mmproj?: string, imageMaxPixels?: number,
-   *   keepEncoders?: boolean }} [opts]
+   *   keepEncoders?: boolean, blackbox?: boolean | 'record' }} [opts]
    *   `chunk` is the prompt tokens per GPU pass to start with; it adapts down when a pass would take longer than
    *   `submitBudgetMs` (default 1000; WebKit kills the GPU at ~3 s) and back up to `maxChunk` (default `chunk`)
    *   when there's room. A larger `maxChunk` reads long prompts faster but sizes activations for it (more memory).
    *   `cache` (default true for URLs) keeps files in the browser's Cache Storage so they download once.
    *   `mmproj` (Omni/VL models) is the encoder file; encoders load only when an image arrives and are freed after
    *   unless `keepEncoders`. `imageMaxPixels` caps image size (default 512·512, at most 256 image tokens).
+   *   `blackbox` (default true) keeps a small record of what Tilde is doing in localStorage, so that after a tab kill
+   *   or a lost GPU the next load backs off (smaller chunks, then context; a shorter submit budget). `'record'` keeps
+   *   the record without changing settings (benchmarks); `llm.blackbox.report()` says how the last session ended.
    */
-  static async load(source, { ctx = 4096, chunk = 64, maxChunk = chunk, submitBudgetMs = 1000, cache = true, gpu, onProgress, mmproj, imageMaxPixels = 512 * 512, keepEncoders = false } = {}) {
+  static async load(source, { ctx = 4096, chunk = 64, maxChunk = chunk, submitBudgetMs = 1000, cache = true, gpu, onProgress, mmproj, imageMaxPixels = 512 * 512, keepEncoders = false, blackbox = true } = {}) {
     gpu ||= await openGpu();
     const open = async (s) => (typeof s === 'string' && cache ? cachedSource(httpSource(s), { key: s }) : typeof s === 'string' ? httpSource(s) : s);
     const src = await open(source);
     const gguf = await readGGUF(src);
     const arch = gguf.kv['general.architecture'];
     if (!ARCHS[arch]) throw new Error(`Tilde doesn't run "${arch}" models yet (it runs: ${architectures.join(', ')})`);
-    const model = await (await ARCHS[arch]()).load(gpu, src, { ctx, chunk, maxChunk, submitBudgetMs, onProgress, gguf });
+    const bb = blackbox && globalThis.localStorage
+      ? new BlackBox(typeof source === 'string' ? source : gguf.kv['general.name'] || arch, { ctx, chunk, maxChunk: Math.max(chunk, maxChunk), submitBudgetMs }, { apply: blackbox !== 'record' })
+      : null;
+    if (bb) ({ ctx, chunk, maxChunk, submitBudgetMs } = bb.settings);
+    const mb = () => Math.round(gpu.total / 1048576);
+    const progress = bb ? (p) => { bb.note({ mb: mb() }); onProgress?.(p); } : onProgress;
+    const model = await (await ARCHS[arch]()).load(gpu, src, { ctx, chunk, maxChunk, submitBudgetMs, onProgress: progress, gguf });
     const k = new Tilde(gpu, model);
+    if (bb) {
+      k.blackbox = bb;
+      bb.note({ stage: 'ready', mb: mb() });
+      const t = gpu.bytes, of = (tag) => Math.round((t.get(tag) || 0) / 1048576);
+      bb.split({ fixedMB: mb() - of('kv') - of('activations'), kvMB: of('kv'), actMB: of('activations'), ctx: model.ctx, maxChunk: model.maxChunk });
+      gpu.onRun = (stage, ms) => bb.note(stage === 'gpu' ? { stage, chunk: model.chunk, mb: mb() } : { stage, ran: true, longestSubmitMs: Math.round(gpu.longestSubmit) });
+      // A loss after a clean exit is the page tearing the device down, not a crash.
+      gpu.whenLost.catch(() => { if (!bb.session.closed) bb.note({ lost: true }, true); });
+    }
     if (mmproj) {
       const src = await open(mmproj);
       k.encoders = { src, gguf: await readGGUF(src) };

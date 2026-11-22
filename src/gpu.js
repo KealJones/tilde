@@ -33,6 +33,8 @@ export class Gpu {
     this.pipelines = new Map();
     /** Longest single submit seen, in ms. */
     this.longestSubmit = 0;
+    /** Called as 'gpu' before each submit and 'idle' after it (the black box records it); null for none. */
+    this.onRun = null;
     this.lost = null;
     // After WebKit's watchdog takes the device, onSubmittedWorkDone and mapAsync never settle; every wait races this
     // so a lost GPU fails fast instead of hanging.
@@ -154,12 +156,14 @@ export class Gpu {
     if (this.lost) throw new Error(`GPU lost: ${this.lost.message || this.lost.reason}`);
     record(enc);
     this.endPass();
+    this.onRun?.('gpu');
     const t0 = performance.now();
     this.flush();
     this.device.queue.submit([enc.finish()]);
     await this.#orLost(this.device.queue.onSubmittedWorkDone());
     const ms = performance.now() - t0;
     this.longestSubmit = Math.max(this.longestSubmit, ms);
+    this.onRun?.('idle', ms);
     if (this.lost) throw new Error(`GPU lost: ${this.lost.message || this.lost.reason}`);
     return ms;
   }

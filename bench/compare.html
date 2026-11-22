@@ -246,6 +246,8 @@ function fillForm() {
 async function startSuite(settings) {
   if (!settings.engines.length || !settings.prompts.length) return status('pick at least one runtime and one prompt size');
   if (settings.prompts.at(-1) + settings.gen > settings.ctx) return status(`the longest prompt plus ${settings.gen} tokens doesn't fit in a ${settings.ctx}-token context`);
+  // ?bbReset=1 forgets Tilde's crash records first, for a clean black-box test.
+  if (qs.get('bbReset') === '1') { for (const k of Object.keys(localStorage)) if (k.startsWith('tilde:blackbox:')) localStorage.removeItem(k); qs.delete('bbReset'); }
   status('reading the tokenizer to build the prompts…');
   const facts = await gatherFacts();
   // Every runtime gets the same text: exactly N tokens of it by the model's own tokenizer (read from its GGUF; only
@@ -520,8 +522,17 @@ function tildeRunner(opts = {}) {
       const kx = await import(TILDE + 'index.js');
       c.stage('loading');
       let t = now();
-      const llm = await kx.Tilde.load(GGUF_(), { ctx: c.ctx, ...opts, onProgress: ({ loaded, total }) => c.progress(`loading ${MB(loaded)} of ${MB(total)} MB`) });
+      // blackbox 'record': keep Tilde's crash record but not its back-off, so every run uses the settings asked for
+      // (?blackbox=apply lets it back off, to test that).
+      const llm = await kx.Tilde.load(GGUF_(), { ctx: c.ctx, ...opts, blackbox: qs.get('blackbox') === 'apply' ? true : 'record', onProgress: ({ loaded, total }) => c.progress(`loading ${MB(loaded)} of ${MB(total)} MB`) });
       const loadS = S(now() - t);
+      const bb = llm.blackbox?.report();
+      if (bb && qs.get('blackbox') === 'apply' && bb.settings.ctx !== c.ctx && (bb.verdict === 'none' || bb.verdict === 'clean')) c.note({ blackbox: `the black box set a context of ${bb.settings.ctx} tokens (asked for ${c.ctx}), from an earlier crash` });
+      if (bb && bb.verdict !== 'none' && bb.verdict !== 'clean') {
+        const p = bb.previous || {};
+        const used = bb.settings.ctx !== c.ctx ? `; it used a context of ${bb.settings.ctx} tokens` + (bb.settings.maxChunk !== (opts.maxChunk ?? opts.chunk ?? 64) ? ` and ${bb.settings.maxChunk}-token chunks` : '') : '';
+        c.note({ blackbox: `Tilde's last session ${({ 'gpu-lost': 'lost the GPU', discarded: 'was discarded by iOS', background: 'ended while hidden or just after coming back' })[bb.verdict] || 'was killed'} during ${p.stage || '?'}${p.mb ? ` at ${p.mb} MB` : ''}${p.chunk ? `, chunk ${p.chunk}` : ''} (would back off to ${bb.levels.capMB != null ? `fit under ${bb.levels.capMB} MB` : `mem ${bb.levels.mem}`}, gpu ${bb.levels.gpu})${qs.get('blackbox') === 'apply' ? used : ''}` });
+      }
       c.stage('warm-up');
       await llm.generate(WARM, { maxTokens: 2, temperature: 0, repeatPenalty: 1 });
       const ids = llm.tokenizer.encode(c.text);
@@ -705,6 +716,7 @@ function why(q) {
   if (r.reason) bits.push(r.reason);
   if (r.waitedForGpuS) bits.push(`waited ${r.waitedForGpuS} s for a GPU first`);
   if (r.hidden) bits.push('page was hidden for part of it');
+  if (r.blackbox) bits.push(r.blackbox);
   if (r.build) bits.push(r.build + (r.threads ? `, ${r.threads} thread${r.threads > 1 ? 's' : ''}` : ''));
   if (r.engineMB) bits.push(`Tilde counted ${r.engineMB} MB` + (r.longestSubmitMs ? `, longest submit ${r.longestSubmitMs} ms` : '') + (r.chunkAtEnd ? `, chunk ${r.chunkAtEnd} at the end` : ''));
   if (r.wrote != null && r.wrote < (q.gen || 0)) bits.push(`wrote ${r.wrote}`);
