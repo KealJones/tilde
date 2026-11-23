@@ -32,7 +32,10 @@ frames does not buy memory.
    audio encoder, speech generator) is loaded when needed and freed after.
 5. **Download once.** URLs are cached in Cache Storage in 16 MB pieces (`src/cache.js`), each under its own path:
    the Cache API ignores `#fragments` when matching, so fragment-keyed pieces would all collide.
-6. **GPU only.** No CPU fallback: a 1.7B model on a phone CPU takes minutes to answer "hi".
+6. **WebGPU first, the CPU when there is none.** Firefox on Android has no WebGPU yet (Nov 2026), and Chrome turns
+   it off for blocklisted GPUs. There the CPU device (`src/cpu.js`) stands in for `Gpu` with the same surface, so
+   the model files run unchanged (see [CPU backend](#cpu-backend)). It is the slow path, never the plan: text only,
+   one thread.
 7. **No build step.** Plain ES modules with JSDoc types, served as-is (GitHub Pages works). Model-specific code
    lives in one file per architecture (LFM3, Qwen3), imported on demand by the GGUF's `general.architecture`; the
    attention kernels take the head counts as parameters, so a new GQA model reuses them.
@@ -103,9 +106,50 @@ iPhone at ~80% loaded.
   rest. Global KV slots up to that point are never written again, so they need no copy. This is what lets a chat
   template that drops the last turn's thinking, or a reply re-tokenized differently, still reuse the prompt.
 
+## CPU backend
+
+`openDevice('auto')` (what `Tilde.load` does) opens WebGPU and falls back to `openCpu()` when there is no
+`navigator.gpu` or no adapter. `?tilde-backend=cpu` on the page's URL forces it, to try it on a phone that has WebGPU.
+
+- **Same model code.** `Cpu` has `Gpu`'s surface: `buffer`/`free` (counted by tag), `device.queue.writeBuffer`,
+  command encoders with `copyBufferToBuffer`, `dispatch`, `run`, `read`, `report`. A dispatch finds its kernel
+  by WGSL source in `kernelInfo` (`src/kernels.js`: the plain exports by name, factories record their arguments)
+  and runs the CPU version of it when the encoder runs, in the same order the GPU would. The loader is shared:
+  weights land in the same repacked layouts, just in WebAssembly memory instead of GPU buffers.
+- **One WebAssembly memory.** Every buffer is a range of it, so the WASM kernels read weights and activations in
+  place, with no copies. Freed ranges are reused; the memory itself never shrinks (WebAssembly can't). The C stack
+  sits below `__heap_base` and buffers start above it (an early version put the token table on the stack, which
+  scribbled on row 33 of LFM3's embedding).
+- **WASM SIMD for the matmuls**, plain JS for the rest. Like llama.cpp's CPU path, activations are quantized to
+  int8 first (Q8_0 blocks of 32 for Q4_0 weights, Q8_K blocks of 256 for the Q6_K head), so the inner loops are
+  int8 dot products, 16 lanes at a time. `src/cpu.c` builds to `src/cpu.wasm` (5 KB, committed; build line at the top
+  of the C).
+- **No watchdog to dodge**, so prompts go through in whole chunks (`submitBudgetMs` is Infinity), and `Cpu#run`
+  gives the page a turn every ~50 ms so it stays responsive.
+- **Text only.** Vision, hearing and speech dispatch about 20 more kernels; `Tilde` says so plainly instead.
+- **One thread.** Workers would need the weights shared (SharedArrayBuffer, so cross-origin isolation, which GitHub
+  Pages can't turn on) or copied into each. Next lever if CPU speed matters.
+
+Checked against llama.cpp (Nov 20, 2026, `tests/cpu.test.js` and `bench/lfm3-check.html?backend=cpu`): same top 5 and
+identical greedy tokens for LFM3 1.7B (12/12 on "The capital of France is", max |logit diff| 0.58; 6/6 on the
+66-token ocean prompt in 64- and 16-token chunks, 0.30) and Qwen3 0.6B (12/12, 0.43; 6/6 on the long prompt, 0.32).
+
+| One x86 core of a 2-core VM, Node 22 | LFM3 1.7B Q4_0 | Qwen3 0.6B Q4_0 |
+|---|---|---|
+| Memory counted | 1,022 MB (ctx 1024) | 523 MB |
+| Prompt reading | 7.6 tok/s | 20 tok/s |
+| Writing | 4.0 tok/s (Q4_0 matvec 186 ms + Q6_K head 50 ms per token) | 11 tok/s (9 in headless Chrome) |
+
+On an iPhone in Safari with `?tilde-backend=cpu` (Nov 20, 2026), LFM3 1.7B wrote **10.3 tok/s** (66 tokens, first
+token after 1.7 s, 1,065 MB counted), on one thread. That is about 84% of the WebGPU path on the same phone (12.3
+tok/s, Nov 19) and roughly 6× wllama's CPU build there (1.4–1.8 tok/s). The phone's big core runs these int8 loops much
+faster than the VM above. Prompt reading is where the GPU stays far ahead: 139–157 tok/s there, against roughly 12 on
+the CPU (a ~20-token chat prompt in 1.7 s).
+
 ## Testing
 
-- `node --test`: GGUF parsing, repacking and CPU reference math.
+- `node --test`: GGUF parsing, repacking, CPU reference math, and the CPU backend: its kernels against the reference
+  math, and whole models against llama.cpp when the files are present.
 - `npm run gpu-test`: kernels in headless Chrome on SwiftShader WebGPU, compared to the CPU reference and to
   llama.cpp's logits for the same prompt.
 - Real devices: the phone relay (KealJones/phone-relay) drives iPhone Safari for load, memory and speed runs.

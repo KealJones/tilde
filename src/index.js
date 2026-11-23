@@ -4,6 +4,7 @@
 //   const text = await llm.chat([{ role: 'user', content: 'hi' }], { onToken: (t) => print(t) });
 
 import { openGpu } from './gpu.js';
+import { openCpu } from './cpu.js';
 import { httpSource } from './gguf.js';
 import { Tokenizer } from './tokenizer.js';
 import { cachedSource, clearCache, cacheFile, cachedFileInfo, removeCachedFile } from './cache.js';
@@ -26,17 +27,38 @@ const speechGen = () => import('./models/lfm3gen.js').then((m) => m.LFM3SpeechGe
 /** Architectures Tilde can run (general.architecture in the GGUF). */
 export const architectures = Object.keys(ARCHS);
 
-export { openGpu, httpSource, Tokenizer, cachedSource, clearCache, cacheFile, cachedFileInfo, removeCachedFile, patchify, logMel, decodeAudio, parseWav, wav, SPEECH_RATE, readVideo, frameTimes };
+export { openGpu, openCpu, httpSource, Tokenizer, cachedSource, clearCache, cacheFile, cachedFileInfo, removeCachedFile, patchify, logMel, decodeAudio, parseWav, wav, SPEECH_RATE, readVideo, frameTimes };
+
+/**
+ * Opens the device Tilde runs on. 'auto' is WebGPU when the browser has a working adapter, else the CPU
+ * (WebAssembly SIMD): Firefox on Android, or a GPU the browser has blocklisted. ?tilde-backend=cpu in the page's URL
+ * forces the CPU, for testing on a phone that has WebGPU.
+ * @param {'auto' | 'gpu' | 'cpu'} backend
+ */
+export async function openDevice(backend = 'auto') {
+  const forced = typeof location === 'object' && new URLSearchParams(location.search).get('tilde-backend');
+  if (forced === 'cpu' || forced === 'gpu') backend = forced;
+  if (backend === 'cpu') return openCpu();
+  if (backend === 'gpu') return openGpu();
+  try {
+    return await openGpu();
+  } catch (e) {
+    const cpu = await openCpu();
+    cpu.fallbackReason = e.message;
+    return cpu;
+  }
+}
 
 const roundEven = (x) => { const r = Math.round(x); return Math.abs(x % 1) === 0.5 && r % 2 ? r - 1 : r; };
 
 export class Tilde {
   /**
-   * Loads a GGUF model onto the GPU, streaming it in.
+   * Loads a GGUF model onto the GPU (or, without WebGPU, into CPU memory), streaming it in.
    * @param {string | import('./gguf.js').ByteSource} source URL or byte source
    * @param {{ ctx?: number, chunk?: number, maxChunk?: number, submitBudgetMs?: number, cache?: boolean,
-   *   gpu?: import('./gpu.js').Gpu, onProgress?: Function, mmproj?: string, imageMaxPixels?: number,
-   *   keepEncoders?: boolean }} [opts]
+   *   backend?: 'auto' | 'gpu' | 'cpu', gpu?: import('./gpu.js').Gpu | import('./cpu.js').Cpu, onProgress?: Function,
+   *   mmproj?: string, imageMaxPixels?: number, keepEncoders?: boolean }} [opts]
+   *   `backend` (default 'auto'): WebGPU when the browser has it, else the CPU (text only; see openDevice).
    *   `chunk` is the prompt tokens per GPU pass to start with; it adapts down when a pass would take longer than
    *   `submitBudgetMs` (default 1000; WebKit kills the GPU at ~3 s) and back up to `maxChunk` (default `chunk`)
    *   when there's room. A larger `maxChunk` reads long prompts faster but sizes activations for it (more memory).
@@ -44,8 +66,10 @@ export class Tilde {
    *   `mmproj` (Omni/VL models) is the encoder file; encoders load only when an image arrives and are freed after
    *   unless `keepEncoders`. `imageMaxPixels` caps image size (default 512·512, at most 256 image tokens).
    */
-  static async load(source, { ctx = 4096, chunk = 64, maxChunk = chunk, submitBudgetMs = 1000, cache = true, gpu, onProgress, mmproj, imageMaxPixels = 512 * 512, keepEncoders = false } = {}) {
-    gpu ||= await openGpu();
+  static async load(source, { ctx = 4096, chunk = 64, maxChunk = chunk, submitBudgetMs, cache = true, backend = 'auto', gpu, onProgress, mmproj, imageMaxPixels = 512 * 512, keepEncoders = false } = {}) {
+    gpu ||= await openDevice(backend);
+    // There is no watchdog on the CPU (Cpu#run yields to the page instead), so prompts go through in whole chunks.
+    submitBudgetMs ??= gpu.backend === 'cpu' ? Infinity : 1000;
     const open = async (s) => (typeof s === 'string' && cache ? cachedSource(httpSource(s), { key: s }) : typeof s === 'string' ? httpSource(s) : s);
     const src = await open(source);
     const gguf = await readGGUF(src);
@@ -64,6 +88,8 @@ export class Tilde {
 
   constructor(gpu, model) {
     this.gpu = gpu;
+    /** 'webgpu', or 'cpu' (WebAssembly; text only). */
+    this.backend = gpu.backend || 'webgpu';
     this.model = model;
     this.tokenizer = Tokenizer.fromGGUF(model.gguf.kv);
     const s = model.gguf.kv;
@@ -186,7 +212,13 @@ export class Tilde {
   }
 
   /** Encodes 16 kHz mono audio (loading the audio encoder if needed) and feeds its embeddings to the model. */
+  /** Pictures, sound and speech run on WebGPU only. */
+  #needsGpu(what) {
+    if (this.backend === 'cpu') throw new Error(`This browser has no WebGPU, so Tilde is running on the CPU, which reads text only (not ${what}).`);
+  }
+
   async #readAudio(pcm, o) {
+    this.#needsGpu('audio');
     if (!this.encoders) throw new Error('This model was loaded without an mmproj, so it cannot hear audio.');
     if (!this.audio) {
       o.onStatus?.('loading audio encoder');
@@ -207,6 +239,7 @@ export class Tilde {
    * (llama.cpp MTMD_VIDEO_TEMPLATE_LFM3_OMNI). The vision encoder stays loaded for the whole clip.
    */
   async #readVideo(video, o) {
+    this.#needsGpu('video');
     if (!this.encoders) throw new Error('This model was loaded without an mmproj, so it cannot watch video.');
     const m = this.model;
     const hasAudioEnc = this.encoders.gguf.tensors.some((t) => t.name.startsWith('a.blk.'));
@@ -255,6 +288,7 @@ export class Tilde {
 
   /** Encodes an image (loading the vision encoder if needed) and feeds its embeddings to the model. */
   async #readImage(image, o) {
+    this.#needsGpu('pictures');
     if (!this.encoders) throw new Error('This model was loaded without an mmproj, so it cannot read images.');
     if (!this.vision) {
       o.onStatus?.('loading vision encoder');
@@ -278,6 +312,7 @@ export class Tilde {
    *   onAudio?: (pcm: Float32Array) => void, onStatus?: (s: string) => void, signal?: AbortSignal }} [opts]
    */
   async speak(text, { voice = 'female', language = 'American English', maxSeconds = 30, temperature, onAudio, onStatus, signal } = {}) {
+    this.#needsGpu('speech');
     if (!this.encoders) throw new Error('This model was loaded without an mmproj, so it cannot speak.');
     if (!this.speechGen) {
       onStatus?.('loading voice');
@@ -358,7 +393,7 @@ export class Tilde {
   }
 
   /** Memory and timing report. */
-  stats() { return this.gpu.report(); }
+  stats() { return { backend: this.backend, ...this.gpu.report() }; }
 }
 
 /**

@@ -4,6 +4,22 @@
 /** Max tokens one matmul dispatch handles per weight pass; longer batches use more dispatches along z. */
 export const MAXT = 8;
 
+/**
+ * Which kernel a WGSL source is: source → { name, args }. Factories register what they make (and return the same
+ * string for the same arguments); src/cpu.js adds the plain exports by name. A device without WebGPU (src/cpu.js)
+ * uses this to run its own version of each kernel, so model files dispatch the same way on both.
+ */
+export const kernelInfo = new Map();
+const factory = (name, make) => {
+  const made = new Map();
+  return (...args) => {
+    const key = args.join();
+    let code = made.get(key);
+    if (!code) { code = make(...args); made.set(key, code); kernelInfo.set(code, { name, args }); }
+    return code;
+  };
+};
+
 const Q6K = /* wgsl */ `
 fn byteAt(base: u32, i: u32) -> u32 { return (W[base + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xffu; }
 // One value of a padded Q6_K block (53 words) starting at word 'base'.
@@ -20,7 +36,7 @@ fn q6k(base: u32, idx: u32) -> f32 {
 }`;
 
 /** Y[t, r] = W[r, :] · X[t, :] for a Q4_0 weight. One workgroup per row, `mt` tokens per pass (1 for decode). */
-export const matmulQ4_0 = (mt = MAXT) => /* wgsl */ `
+export const matmulQ4_0 = factory('matmulQ4_0', (mt = MAXT) => /* wgsl */ `
 struct P { rows: u32, K: u32, T: u32, dOff: u32, yStride: u32, yOff: u32, xStride: u32, accumulate: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> W: array<u32>;
@@ -66,7 +82,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let v = red[lid.x * WG];
     Y[i] = select(v, Y[i] + v, p.accumulate == 1u);
   }
-}`;
+}`);
 
 /** Y[r] = W[r, :] · X for a padded Q6_K weight, one token (the output head). */
 export const matmulQ6_K = /* wgsl */ `
@@ -176,7 +192,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 
 /** Writes K and V rows [T, KVH, 128] into ring caches of `slots` slots at position pos0 + t, as f16 pairs in u32
  * (llama.cpp's default KV type, and half the memory). */
-export const kvWriteFor = (KVH) => /* wgsl */ `
+export const kvWriteFor = factory('kvWriteFor', (KVH) => /* wgsl */ `
 struct P { pos0: u32, slots: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> K: array<f32>;
@@ -192,7 +208,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     KC[slot * ${KVH * 64}u + i] = pack2x16float(vec2<f32>(K[s], K[s + 1u]));
     VC[slot * ${KVH * 64}u + i] = pack2x16float(vec2<f32>(Vv[s], Vv[s + 1u]));
   }
-}`;
+}`);
 export const kvWrite = kvWriteFor(4);
 
 // Position held by cache slot j once positions up to maxPos are written (ring of 'slots').
@@ -203,7 +219,7 @@ fn slotPos(j: u32, maxPos: u32, slots: u32) -> i32 {
 }`;
 
 /** S[t·H+h, j] = q·k / √128 with causal and window masks (−inf when hidden); H query heads share KVH KV heads. */
-export const attnScoresFor = (H, KVH) => /* wgsl */ `
+export const attnScoresFor = factory('attnScoresFor', (H, KVH) => /* wgsl */ `
 struct P { pos0: u32, T: u32, slots: u32, L: u32, window: u32, sStride: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> Q: array<f32>;
@@ -229,7 +245,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     s = acc * 0.08838834764831845;
   }
   S[th * p.sStride + j] = s;
-}`;
+}`);
 export const attnScores = attnScoresFor(16, 4);
 
 /** Softmax in place over rows of length L. */
@@ -255,7 +271,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }`;
 
 /** O[t, h, :] = sigmoid(G[t, h]) · Σ_j P[t·H+h, j] · V[j, h/(H/KVH), :]; without `gated`, no G and no sigmoid. */
-export const attnOutFor = (H, KVH, gated = true) => /* wgsl */ `
+export const attnOutFor = factory('attnOutFor', (H, KVH, gated = true) => /* wgsl */ `
 struct P { L: u32, sStride: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> S: array<f32>;
@@ -272,7 +288,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
   }
 ${gated ? `  let g = 1.0 / (1.0 + exp(-G[th]));
   O[th * 128u + d] = acc * g;` : '  O[th * 128u + d] = acc;'}
-}`;
+}`);
 export const attnOut = attnOutFor(16, 4);
 
 /**
@@ -281,7 +297,7 @@ export const attnOut = attnOutFor(16, 4);
  * through shared memory 16 keys at a time with a running max and sum, so the T×H×L score matrix is never written.
  * Same masks as attnScoresFor (causal, window, ring slots). Grid: [ceil(T / (16/G)), KVH].
  */
-export const attnFlashFor = (H, KVH, gated = true) => {
+export const attnFlashFor = factory('attnFlashFor', (H, KVH, gated = true) => {
   const G = H / KVH, BT = 16 / G;
   return /* wgsl */ `
 struct P { pos0: u32, T: u32, slots: u32, L: u32, window: u32, pad0: u32, pad1: u32, pad2: u32 }
@@ -358,7 +374,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     }
   }
 }`;
-};
+});
 export const attnFlash = attnFlashFor(16, 4);
 
 /** LFM short conv over T tokens: Y = C ⊙ conv7(B ⊙ X), keeping the last 6 inputs per channel as state. */
@@ -403,7 +419,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ───────────── Shared by the Omni senses (encoders run all positions at once, non-causal) ─────────────
 
 /** Y[t, r] = W[r, :] · X[t, :] (+ b[r]) for a Q8_0 weight. One workgroup per row, `mt` tokens per pass. */
-export const matmulQ8_0 = (mt = MAXT) => /* wgsl */ `
+export const matmulQ8_0 = factory('matmulQ8_0', (mt = MAXT) => /* wgsl */ `
 struct P { rows: u32, K: u32, T: u32, dOff: u32, bias: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> W: array<u32>;
@@ -446,10 +462,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     if (p.bias == 1u) { v += B[row]; }
     Y[(t0 + lid.x) * p.rows + row] = v;
   }
-}`;
+}`);
 
 /** Y[t, r] = W[r, :] · X[t, :] (+ b[r]) for an f32 weight. */
-export const matmulF32 = (mt = MAXT) => /* wgsl */ `
+export const matmulF32 = factory('matmulF32', (mt = MAXT) => /* wgsl */ `
 struct P { rows: u32, K: u32, T: u32, bias: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
@@ -481,7 +497,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     if (p.bias == 1u) { v += B[row]; }
     Y[(t0 + lid.x) * p.rows + row] = v;
   }
-}`;
+}`);
 
 /** LayerNorm with bias over rows of length N. */
 export const layernorm = /* wgsl */ `
@@ -928,7 +944,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }`;
 
 /** Causal short conv of width W over T tokens from a zero state: Y = C ⊙ conv(B ⊙ X). Channels N, BCX rows 3N. */
-export const shortconvFresh = (W) => /* wgsl */ `
+export const shortconvFresh = factory('shortconvFresh', (W) => /* wgsl */ `
 struct P { T: u32, N: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage, read> BCX: array<f32>;
@@ -947,7 +963,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
   Y[t * p.N + ch] = BCX[t * 3u * p.N + p.N + ch] * acc;
-}`;
+}`);
 
 /** NeoX RoPE in place on [T, H, D] at positions pos0 + t: pairs (i, i + D/2), θ_i = pos · base^(-2i/D). */
 export const ropeN = /* wgsl */ `

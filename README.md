@@ -48,6 +48,9 @@ video with its sound, audio in, its own voice out) and Qwen3 0.6B; see [Models](
   seconds with no network.
 - **Reads official GGUFs directly.** No conversion step and no extra hosting: point it at Liquid's file on Hugging
   Face.
+- **Runs without WebGPU too.** Where the browser has none (Firefox on Android, a blocklisted GPU), the same model code
+  runs on the CPU in WebAssembly SIMD, text only, matching llama.cpp's tokens. Slower, but it answers instead of
+  failing. [How](docs/design.md#cpu-backend).
 - **No build step, no `shader-f16` required.** Plain ES modules with JSDoc types. Import it from jsDelivr or serve it
   from GitHub Pages as-is.
 
@@ -108,6 +111,9 @@ await llm.chat([{ role: 'user', content: 'Hi! Who are you?' }], {
 
 console.log(llm.stats()); // what the engine holds on the GPU
 ```
+
+Without WebGPU, `Tilde.load` runs on the CPU instead (`llm.backend === 'cpu'`, text only). Pass `backend: 'gpu'` to
+fail rather than fall back, or `backend: 'cpu'` (or add `?tilde-backend=cpu` to the page's URL) to try the CPU path.
 
 For the multimodal model, pass the encoder file as `mmproj`; each sense loads only when it's used:
 

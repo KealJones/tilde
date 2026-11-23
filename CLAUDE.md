@@ -8,7 +8,11 @@ GPU; ~3 s per GPU command buffer). Read docs/design.md first; it is the contract
 - Plain ES modules, no build step, JSDoc for types. Must run as-is from GitHub Pages.
 - Never hold a whole model file in memory. Weights stream tensor by tensor through a small staging buffer.
 - Every GPU buffer goes through the engine's allocator so memory is counted.
-- GPU only. No CPU fallback path.
+- WebGPU first. Without WebGPU (Firefox on Android, blocklisted GPUs) the CPU device in src/cpu.js runs the same
+  model files: it has Gpu's surface and runs its own version of each kernel, looked up by WGSL source through
+  `kernelInfo` in src/kernels.js. Never fork model code per backend. A kernel a text model dispatches needs a CPU
+  version in src/cpu.js too, checked in tests/cpu.test.js. Media (vision, audio, speech) is WebGPU only for now.
+- src/cpu.wasm is built from src/cpu.c (build line at its top) and committed; rebuild it after changing the C.
 - Kernels must not need `shader-f16`: store halves in u32 and use `unpack2x16float`.
 - Model-specific code lives in one file per architecture (src/models/<arch>.js).
 - Every kernel change is checked against the CPU reference (src/quant.js, src/ref/) and, for whole-model changes,
@@ -16,7 +20,9 @@ GPU; ~3 s per GPU command buffer). Read docs/design.md first; it is the contract
 
 ## Commands
 
-- `npm test`: CPU tests (GGUF parsing, repacking, reference math). The header test uses a local GGUF if
+- `npm test`: CPU tests (GGUF parsing, repacking, reference math, the CPU backend's kernels). tests/cpu.test.js also runs
+  whole models on the CPU backend against llama.cpp dumps when /home/claude/models and /home/claude/ref (or
+  `TILDE_MODELS`, `TILDE_REFS`) hold them (`qwen-hello.bin`, `lfm3-hello.bin`). The header test uses a local GGUF if
   `TILDE_GGUF` (or /home/claude/models/LFM3-1.7B-QAD-Q4_0.gguf) exists, otherwise it is skipped.
 - `npm run gpu-test`: kernels in headless Chrome on SwiftShader WebGPU (needs Chrome; set CHROME to its path).
 
@@ -42,7 +48,7 @@ int32/f32). Mount the model and the dump into the bench server:
 
     TILDE_MOUNTS="/models=/path/to/ggufs /ref=/path/to/dumps" npm run gpu-test -- "lfm3-check.html?gen=4"
 
-The page picks the model class from the GGUF's architecture (LFM3 or Qwen3). Make a dump with
+The page picks the model class from the GGUF's architecture (LFM3 or Qwen3). `&backend=cpu` runs it on the CPU device. Make a dump with
 `tools/llama-dump.cpp` (build line at its top): `llama-dump model.gguf "The capital of France is" out.bin 12`.
 
 SwiftShader is slow (~80 s per token for LFM3 1.7B on 2 cores, ~17 s for Qwen3 0.6B), so keep `gen` small.
