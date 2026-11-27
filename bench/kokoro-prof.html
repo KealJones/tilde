@@ -23,6 +23,7 @@ const u = (vals, fl = []) => { const a = new Uint32Array(vals.length), f = new F
 
 const sm = new URLSearchParams(location.search).has('small') ? 40 : 1; // ?small: SwiftShader-sized
 const gpu = await openGpu();
+const reg4 = Kn.conv1dRegSrc(4), reg8 = Kn.conv1dRegSrc(8);
 let seed = 1;
 const rnd = (n, sc = 1) => { const a = new Float32Array(n); for (let i = 0; i < n; i++) { seed = (seed * 1103515245 + 12345) >>> 0; a[i] = (seed / 2147483648 - 1) * sc; } return a; };
 const buf = (data) => { const b = gpu.buffer(data.length * 4, 'prof'); gpu.device.queue.writeBuffer(b, 0, data); return b; };
@@ -46,10 +47,19 @@ try {
     const g = [Math.ceil(T / 64), Math.ceil(C / 64)], flop = 2 * C * C * K * T;
     const a = await time(`conv1d    ${C}×${T} k${K} d${d}`, 3, (enc) => gpu.dispatch(enc, Kn.conv1d, [uni, W, X, B, Y1], g), flop);
     const b = await time(`conv1dWin ${C}×${T} k${K} d${d}`, 3, (enc) => gpu.dispatch(enc, Kn.conv1dWin, [uni, W, X, B, Y2], g), flop);
-    const y1 = new Float32Array(await gpu.read(Y1)), y2 = new Float32Array(await gpu.read(Y2));
-    let md = 0, mx = 0; for (let i = 0; i < y1.length; i++) { md = Math.max(md, Math.abs(y1[i] - y2[i])); mx = Math.max(mx, Math.abs(y1[i])); }
-    log(`  same output: max diff ${md.toExponential(2)} of ${mx.toFixed(2)}`);
-    rows.push({ C, T, K, d, old: a, win: b, diff: md / mx });
+    const y1 = new Float32Array(await gpu.read(Y1));
+    const cmp = async (Y, label) => {
+      const y2 = new Float32Array(await gpu.read(Y));
+      let md = 0, mx = 0; for (let i = 0; i < y1.length; i++) { md = Math.max(md, Math.abs(y1[i] - y2[i])); mx = Math.max(mx, Math.abs(y1[i])); }
+      log(`  ${label} same output: max diff ${md.toExponential(2)} of ${mx.toFixed(2)}`);
+      return md / mx;
+    };
+    const dWin = await cmp(Y2, 'win');
+    const r4 = await time(`conv reg4  ${C}×${T} k${K} d${d}`, 3, (enc) => gpu.dispatch(enc, reg4, [uni, W, X, B, Y2], [Math.ceil(T / 64), Math.ceil(C / 64)]), flop);
+    const d4 = await cmp(Y2, 'reg4');
+    const r8 = await time(`conv reg8  ${C}×${T} k${K} d${d}`, 3, (enc) => gpu.dispatch(enc, reg8, [uni, W, X, B, Y2], [Math.ceil(T / 128), Math.ceil(C / 64)]), flop);
+    const d8 = await cmp(Y2, 'reg8');
+    rows.push({ C, T, K, d, old: a, win: b, reg4: r4, reg8: r8, diff: Math.max(dWin, d4, d8) });
     [W, X, B, Y1, Y2].forEach((x) => gpu.free(x));
   }
   mark('adain, convT, axpby', 0.8);
