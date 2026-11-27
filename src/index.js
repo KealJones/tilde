@@ -37,7 +37,7 @@ export async function loadKokoro(backbone, mmproj, { gpu, cache = true, onProgre
 /** Architectures Tilde can run (general.architecture in the GGUF). */
 export const architectures = Object.keys(ARCHS);
 
-export { openGpu, httpSource, Tokenizer, cachedSource, clearCache, cacheFile, cachedFileInfo, removeCachedFile, patchify, logMel, decodeAudio, parseWav, wav, SPEECH_RATE, readVideo, frameTimes };
+export { openGpu, httpSource, Tokenizer, cachedSource, clearCache, cacheFile, cachedFileInfo, removeCachedFile, patchify, logMel, decodeAudio, parseWav, wav, SPEECH_RATE, trimSilence, chunkSentences, ClipPlayer, readVideo, frameTimes };
 
 const roundEven = (x) => { const r = Math.round(x); return Math.abs(x % 1) === 0.5 && r % 2 ? r - 1 : r; };
 
