@@ -112,8 +112,10 @@ a voice is a [510][256] table in the file and one row (picked by the phoneme cou
 
 - **On the GPU**: the encoder, the text CNN, every LSTM (input projection as a matmul, then one workgroup per
   direction runs the recurrence with W_hh transposed so its reads coalesce), AdaIN/AdaLayerNorm, the F0/energy
-  blocks, the decoder and the generator. Convolutions are one 64×64-tiled implicit-GEMM kernel (`conv1d`) with
-  stride, dilation, offsets into channel concats and a fused residual add; the generator's upsampling is `convT1d`.
+  blocks, the decoder and the generator. Convolutions with stride 1 use `conv1dRegSrc(8)`: 16 input channels staged once per
+  workgroup and reused for every tap, accumulators in vec4 registers (about 500 GFLOP/s on an iPhone against 70 for
+  the plain tiled `conv1d`, which keeps the strided ones). Both do dilation, offsets into channel concats and a fused
+  residual add; the generator's upsampling is `convT1d`.
 - **In JS**, between stages: durations (round half to even) and the frame index, the harmonic source and its STFT
   (n_fft 20, hop 5), and the inverse STFT. Three small reads: duration logits, the F0 curve, the final spectrum.
 - **Submits**: the encoder and prosody are one each; every residual block of the decoder and generator is its own
