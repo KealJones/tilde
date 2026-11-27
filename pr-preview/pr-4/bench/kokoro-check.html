@@ -22,6 +22,7 @@ import { openGpu } from '../src/gpu.js';
 import { httpSource } from '../src/gguf.js';
 import { Kokoro, gaussian } from '../src/models/kokoro.js';
 import { KokoroRef } from '../src/ref/kokoro.js';
+import { wav } from '../src/speech.js';
 
 const qs = new URLSearchParams(location.search);
 const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
@@ -98,28 +99,14 @@ async function loadReal(gpu, frac) {
   return k;
 }
 
-// Call from a tap. 'playback' keeps iOS from muting Web Audio when the ringer switch is on silent.
-function audioOut() {
-  if (navigator.audioSession) navigator.audioSession.type = 'playback';
-  const ac = new AudioContext();
-  ac.resume();
-  return ac;
-}
-
-function playAt(ac, pcm, at) {
-  const b = ac.createBuffer(1, pcm.length, 24000);
-  b.copyToChannel(pcm, 0);
-  const s = ac.createBufferSource();
-  s.buffer = b;
-  s.connect(ac.destination);
-  s.start(at);
-  return at + b.duration;
-}
+// An <audio> element, not Web Audio: Web Audio stayed silent on an iPhone even with the context running.
+const el = Object.assign(new Audio(), { preload: 'auto' });
+const url = (pcm) => URL.createObjectURL(new Blob([wav(pcm, 24000)], { type: 'audio/wav' }));
 
 function playButton(pcm) {
   const btn = document.getElementById('play');
   btn.hidden = false;
-  btn.onclick = () => { const ac = audioOut(); playAt(ac, pcm, ac.currentTime); };
+  btn.onclick = () => { el.onended = null; el.src = url(pcm); el.play().catch((e) => log('play failed', e.message)); };
 }
 
 async function longCheck(gpu) {
@@ -150,12 +137,17 @@ async function longCheck(gpu) {
   live.hidden = false;
   live.onclick = async () => {
     live.disabled = true;
-    const ac = audioOut();
-    let end = 0;
+    // Unlock the element inside the tap, then queue each sentence and play the next one when the last ends.
+    el.src = url(new Float32Array(240));
+    el.play().catch((e) => log('play failed', e.message));
+    const queue = [];
+    let busy = true;
+    const next = () => { const u = queue.shift(); busy = !!u; if (u) { el.src = u; el.play().catch((e) => log('play failed', e.message)); } };
+    el.onended = next;
     for (let i = 0; i < sents.length; i++) {
       mark(`Live: making sentence ${i + 1} of ${sents.length}`, (i + 1) / sents.length);
-      const pcm = await k.speak(sents[i], { voice });
-      end = playAt(ac, pcm, Math.max(ac.currentTime, end));
+      queue.push(url(await k.speak(sents[i], { voice })));
+      if (!busy || el.ended) next();
     }
     mark('Live: all made', 1);
     live.disabled = false;
