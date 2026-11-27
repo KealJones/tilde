@@ -103,6 +103,17 @@ async function loadReal(gpu, frac) {
 const el = Object.assign(new Audio(), { preload: 'auto' });
 const url = (pcm) => URL.createObjectURL(new Blob([wav(pcm, 24000)], { type: 'audio/wav' }));
 
+// Kokoro pads each clip with silence; keep 30 ms before the speech and 150 ms after (a natural pause).
+// shortcut: fixed threshold at 2% of the clip's peak, revisit if quiet voices lose their first sound.
+function trim(pcm) {
+  const thr = 0.02 * pcm.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+  let a = 0, b = pcm.length - 1;
+  while (a < b && Math.abs(pcm[a]) < thr) a++;
+  while (b > a && Math.abs(pcm[b]) < thr) b--;
+  const lead = a / 24, tail = (pcm.length - 1 - b) / 24;
+  return { pcm: pcm.subarray(Math.max(0, a - 720), Math.min(pcm.length, b + 3600)), lead, tail };
+}
+
 function playButton(pcm) {
   const btn = document.getElementById('play');
   btn.hidden = false;
@@ -120,12 +131,12 @@ async function longCheck(gpu) {
   for (let i = 0; i < sents.length; i++) {
     mark(`Speaking sentence ${i + 1} of ${sents.length}`, 0.3 + 0.7 * i / sents.length);
     const t1 = performance.now();
-    const pcm = await k.speak(sents[i], { voice });
+    const { pcm, lead, tail } = trim(await k.speak(sents[i], { voice }));
     const ready = (performance.now() - t0) / 1000, dur = pcm.length / 24000;
     if (i === 0) first = playEnd = ready; else gaps.push(Math.max(0, ready - playEnd));
     playEnd = Math.max(playEnd, ready) + dur;
     pcms.push(pcm);
-    log(`${i + 1}: ${sents[i].length} phonemes, ${Math.round(performance.now() - t1)} ms for ${dur.toFixed(2)} s` + (i ? `, silence before it ${gaps[i - 1].toFixed(2)} s` : ''), JSON.stringify(k.times));
+    log(`${i + 1}: ${sents[i].length} phonemes, ${Math.round(performance.now() - t1)} ms for ${dur.toFixed(2)} s` + (i ? `, silence before it ${gaps[i - 1].toFixed(2)} s` : ''), JSON.stringify(k.times), `padding trimmed: ${Math.round(lead)} ms before, ${Math.round(tail)} ms after`);
   }
   const all = new Float32Array(pcms.reduce((a, p) => a + p.length, 0));
   pcms.reduce((o, p) => (all.set(p, o), o + p.length), 0);
@@ -137,18 +148,33 @@ async function longCheck(gpu) {
   live.hidden = false;
   live.onclick = async () => {
     live.disabled = true;
-    // Unlock the element inside the tap, then queue each sentence and play the next one when the last ends.
-    el.src = url(new Float32Array(240));
-    el.play().catch((e) => log('play failed', e.message));
+    // Two players: the next sentence loads into the idle one while the current one plays, so the
+    // hand-off on 'ended' is just play(), not a fresh load.
+    const els = [el, Object.assign(new Audio(), { preload: 'auto' })];
+    for (const e of els) { e.onended = null; e.src = url(new Float32Array(240)); e.play().catch((x) => log('play failed', x.message)); } // unlock both inside the tap
     const queue = [];
-    let busy = true;
-    const next = () => { const u = queue.shift(); busy = !!u; if (u) { el.src = u; el.play().catch((e) => log('play failed', e.message)); } };
-    el.onended = next;
+    let cur = -1, playing = false, endedAt = 0;
+    const hand = [];
+    const next = () => {
+      const u = queue.shift();
+      playing = !!u;
+      if (!u) return;
+      cur = (cur + 1) % 2;
+      const e = els[cur];
+      if (e.src !== u) e.src = u;
+      e.onplaying = () => { if (endedAt) hand.push(performance.now() - endedAt); e.onplaying = null; };
+      e.play().catch((x) => log('play failed', x.message));
+      if (queue[0]) { els[(cur + 1) % 2].src = queue[0]; els[(cur + 1) % 2].load(); }
+    };
+    for (const e of els) e.onended = () => { if (e === els[cur]) { endedAt = performance.now(); next(); } };
     for (let i = 0; i < sents.length; i++) {
       mark(`Live: making sentence ${i + 1} of ${sents.length}`, (i + 1) / sents.length);
-      queue.push(url(await k.speak(sents[i], { voice })));
-      if (!busy || el.ended) next();
+      queue.push(url(trim(await k.speak(sents[i], { voice })).pcm));
+      if (!playing) next();
+      else if (queue.length === 1) { const idle = els[(cur + 1) % 2]; idle.src = queue[0]; idle.load(); }
     }
+    await new Promise((r) => { const t = setInterval(() => { if (!playing) { clearInterval(t); r(); } }, 200); });
+    log(`live hand-offs (end of one clip to the next one sounding): ${hand.map((h) => Math.round(h)).join(', ')} ms`);
     mark('Live: all made', 1);
     live.disabled = false;
   };
