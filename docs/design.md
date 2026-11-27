@@ -103,6 +103,25 @@ iPhone at ~80% loaded.
   rest. Global KV slots up to that point are never written again, so they need no copy. This is what lets a chat
   template that drops the last turn's thinking, or a reply re-tokenized differently, still reuse the prompt.
 
+## Kokoro (text to speech)
+
+Kokoro-82M from ggml-org's GGUFs, ported from llama.cpp (`src/models/kokoro.cpp`, `tools/mtmd/models/kokoro.cpp`):
+an ALBERT encoder over phonemes (one stored layer applied 12 times, 128-wide embeddings projected to 768), then the
+StyleTTS2 prosody predictor and the iSTFTNet decoder from the mmproj. All weights load as f32 (~330 MB of GPU memory);
+a voice is a [510][256] table in the file and one row (picked by the phoneme count) is read per utterance.
+
+- **On the GPU**: the encoder, the text CNN, every LSTM (input projection as a matmul, then one workgroup per
+  direction runs the recurrence with W_hh transposed so its reads coalesce), AdaIN/AdaLayerNorm, the F0/energy
+  blocks, the decoder and the generator. Convolutions are one 64×64-tiled implicit-GEMM kernel (`conv1d`) with
+  stride, dilation, offsets into channel concats and a fused residual add; the generator's upsampling is `convT1d`.
+- **In JS**, between stages: durations (round half to even) and the frame index, the harmonic source and its STFT
+  (n_fft 20, hop 5), and the inverse STFT. Three small reads: duration logits, the F0 curve, the final spectrum.
+- **Submits**: the encoder and prosody are one each; every residual block of the decoder and generator is its own
+  submit, so a long sentence stays under WebKit's ~3 s per command buffer.
+- **Checked** by `bench/kokoro-check.html`: random weights at the real shapes against `src/ref/kokoro.js` (a plain
+  port of llama.cpp's graph), and `?real` loads the GGUFs, speaks and times each stage.
+- Not yet: the G2P (the GGUF's "tts" template ports misaki), splitting inputs over 510 phonemes.
+
 ## Testing
 
 - `node --test`: GGUF parsing, repacking and CPU reference math.

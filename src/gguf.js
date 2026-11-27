@@ -160,12 +160,12 @@ export function bufferSource(bytes) {
 const DEC = new TextDecoder();
 
 /**
- * Parses a GGUF header.
+ * Parses a GGUF header. `skip(key)` true leaves that metadata value out (e.g. a big dictionary nobody reads).
  * @param {ByteSource} src
  * @returns {Promise<{ version: number, kv: Record<string, any>, tensors: Tensor[], dataOffset: number, alignment: number }>}
  * @typedef {{ name: string, dims: number[], type: number, typeName: string, count: number, offset: number, nbytes: number }} Tensor
  */
-export async function readGGUF(src, { chunk = 4 << 20 } = {}) {
+export async function readGGUF(src, { chunk = 4 << 20, skip } = {}) {
   let buf = await src.read(0, chunk);
   let end = buf.length;
   let p = 0;
@@ -226,8 +226,26 @@ export async function readGGUF(src, { chunk = 4 << 20 } = {}) {
   const nTensors = await u64();
   const nKV = await u64();
 
+  // Steps over a value without decoding it.
+  const pass = async (t) => {
+    if (t === 8) { const n = await u64(); await need(n); p += n; return; }
+    if (t === 9) {
+      const et = await u32(), n = await u64();
+      if (et === 8) { for (let i = 0; i < n; i++) { const m = await u64(); await need(m); p += m; } return; }
+      const [size] = scalar[et] || [];
+      if (!size) throw new Error(`GGUF array of unknown type ${et}`);
+      await need(size * n); p += size * n; return;
+    }
+    const [size] = scalar[t] || [];
+    if (!size) throw new Error(`GGUF value of unknown type ${t}`);
+    await need(size); p += size;
+  };
+
   const kv = {};
-  for (let i = 0; i < nKV; i++) { const k = await str(); kv[k] = await value(await u32()); }
+  for (let i = 0; i < nKV; i++) {
+    const k = await str(), t = await u32();
+    if (skip?.(k)) await pass(t); else kv[k] = await value(t);
+  }
 
   const tensors = [];
   for (let i = 0; i < nTensors; i++) {

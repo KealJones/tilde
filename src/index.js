@@ -23,6 +23,17 @@ const vision = () => import('./models/lfm3vl.js').then((m) => m.LFM3Vision);
 const audio = () => import('./models/lfm3a.js').then((m) => m.LFM3Audio);
 const speechGen = () => import('./models/lfm3gen.js').then((m) => m.LFM3SpeechGen);
 
+/**
+ * Loads Kokoro-82M text to speech from its two GGUFs (the "kokoro" backbone and its mmproj), as URLs or byte
+ * sources; URLs are cached like Tilde.load's. `await k.speak(phonemes, { voice, speed })` gives 24 kHz PCM.
+ */
+export async function loadKokoro(backbone, mmproj, { gpu, cache = true, onProgress } = {}) {
+  gpu ||= await openGpu();
+  const open = async (s) => (typeof s === 'string' && cache ? cachedSource(httpSource(s), { key: s }) : typeof s === 'string' ? httpSource(s) : s);
+  const { Kokoro } = await import('./models/kokoro.js');
+  return Kokoro.load(gpu, await open(backbone), await open(mmproj), { onProgress });
+}
+
 /** Architectures Tilde can run (general.architecture in the GGUF). */
 export const architectures = Object.keys(ARCHS);
 
