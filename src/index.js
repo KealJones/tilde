@@ -12,7 +12,7 @@ import { readGGUF } from './gguf.js';
 import { patchify } from './image.js';
 import { readVideo, groups as videoGroups, frameTimes } from './video.js';
 import { logMel, decodeAudio, parseWav } from './audio.js';
-import { Istft, sampleCode, wav, SPEECH_RATE } from './speech.js';
+import { Istft, sampleCode, wav, SPEECH_RATE, trimSilence, chunkSentences, ClipPlayer } from './speech.js';
 
 // Model code loads on demand: only the file for the GGUF's architecture, and each sense's encoder when it is
 // first used, so adding architectures costs nothing to pages that don't run them.
