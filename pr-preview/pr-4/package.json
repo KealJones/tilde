@@ -1,7 +1,7 @@
 {
   "name": "tilde",
   "version": "0.1.0",
-  "description": "WebGPU engine for small language models that survives iPhone Safari",
+  "description": "WebGPU engine for small language and speech models that survives iPhone Safari",
   "type": "module",
   "main": "src/index.js",
   "license": "MIT",

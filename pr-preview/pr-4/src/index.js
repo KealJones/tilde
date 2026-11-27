@@ -2,6 +2,7 @@
 //
 //   const llm = await Tilde.load('https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-QAD-Q4_0.gguf');
 //   const text = await llm.chat([{ role: 'user', content: 'hi' }], { onToken: (t) => print(t) });
+//   const kokoro = await loadKokoro(backboneUrl, mmprojUrl); const pcm = await kokoro.speak(phonemes);
 
 import { openGpu } from './gpu.js';
 import { httpSource } from './gguf.js';
