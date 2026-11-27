@@ -1,6 +1,6 @@
 # Tilde design
 
-Tilde runs small language models in a browser tab on WebGPU, built to survive iPhone Safari. iOS kills a tab
+Tilde runs small language and speech models in a browser tab on WebGPU, built to survive iPhone Safari. iOS kills a tab
 that uses too much memory (Jetsam) or keeps the GPU busy too long; Tilde is built around both limits instead of
 hoping to stay under them.
 
@@ -122,7 +122,16 @@ a voice is a [510][256] table in the file and one row (picked by the phoneme cou
   submit, so a long sentence stays under WebKit's ~3 s per command buffer.
 - **Checked** by `bench/kokoro-check.html`: random weights at the real shapes against `src/ref/kokoro.js` (a plain
   port of llama.cpp's graph), and `?real` loads the GGUFs, speaks and times each stage.
-- Not yet: the G2P (the GGUF's "tts" template ports misaki), splitting inputs over 510 phonemes.
+- **Long replies**: one call takes at most 510 phonemes. `chunkSentences` (src/speech.js) groups sentences into
+  calls, the first one sentence for a fast first sound and each later one up to 3× the one before (synthesis runs
+  ~4× faster than playback on an iPhone 16 Pro, so each is ready before the one before ends), so the voice carries
+  its intonation across sentences. `trimSilence` cuts the ~0.3 s and ~0.5 s of silence Kokoro pads each clip with,
+  keeping 30 ms and 250 ms. `ClipPlayer` plays the clips on three `<audio>` elements (Web Audio stayed silent on an
+  iPhone): one plays, one loads the next clip, one finishes the clip before. Switching elements takes ~110 ms on an
+  iPhone, so each clip starts 120 ms early, inside the one before's trailing silence. A 17-sentence reply (9 calls)
+  starts in 0.7 s and plays with no gaps.
+- Not yet: turning text into phonemes (the G2P; the GGUF's "tts" template ports misaki), and splitting a single
+  sentence longer than 510 phonemes.
 
 ## Testing
 
