@@ -10,7 +10,7 @@
 </style>
 <div id="step">Starting…</div>
 <div id="bar"><div></div></div>
-<button id="play" hidden>Play</button>
+<button id="play" hidden>Play</button> <button id="live" hidden>Speak it live</button>
 <pre id="log"></pre>
 <script type="module">
 // Kokoro on the GPU against the CPU reference (src/ref/kokoro.js).
@@ -98,10 +98,28 @@ async function loadReal(gpu, frac) {
   return k;
 }
 
+// Call from a tap. 'playback' keeps iOS from muting Web Audio when the ringer switch is on silent.
+function audioOut() {
+  if (navigator.audioSession) navigator.audioSession.type = 'playback';
+  const ac = new AudioContext();
+  ac.resume();
+  return ac;
+}
+
+function playAt(ac, pcm, at) {
+  const b = ac.createBuffer(1, pcm.length, 24000);
+  b.copyToChannel(pcm, 0);
+  const s = ac.createBufferSource();
+  s.buffer = b;
+  s.connect(ac.destination);
+  s.start(at);
+  return at + b.duration;
+}
+
 function playButton(pcm) {
   const btn = document.getElementById('play');
   btn.hidden = false;
-  btn.onclick = () => { const ac = new AudioContext(); const b = ac.createBuffer(1, pcm.length, 24000); b.copyToChannel(pcm, 0); const s = ac.createBufferSource(); s.buffer = b; s.connect(ac.destination); s.start(); };
+  btn.onclick = () => { const ac = audioOut(); playAt(ac, pcm, ac.currentTime); };
 }
 
 async function longCheck(gpu) {
@@ -127,6 +145,21 @@ async function longCheck(gpu) {
   const total = gaps.reduce((a, b) => a + b, 0);
   log(`first sentence after ${first.toFixed(2)} s; silence between sentences: total ${total.toFixed(2)} s, worst ${Math.max(...gaps).toFixed(2)} s, ${gaps.filter((g) => g > 0.05).length} of ${gaps.length} gaps over 50 ms`);
   playButton(all);
+  // Speak it again, each sentence playing as soon as it's made (what voice mode does).
+  const live = document.getElementById('live');
+  live.hidden = false;
+  live.onclick = async () => {
+    live.disabled = true;
+    const ac = audioOut();
+    let end = 0;
+    for (let i = 0; i < sents.length; i++) {
+      mark(`Live: making sentence ${i + 1} of ${sents.length}`, (i + 1) / sents.length);
+      const pcm = await k.speak(sents[i], { voice });
+      end = playAt(ac, pcm, Math.max(ac.currentTime, end));
+    }
+    mark('Live: all made', 1);
+    live.disabled = false;
+  };
   window.__stats = { first, gaps, total, audio: all.length / 24000 };
   return !all.some(Number.isNaN);
 }
