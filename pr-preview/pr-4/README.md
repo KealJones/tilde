@@ -1,6 +1,6 @@
 <h1 align="center">Tilde~Engine</h1>
 
-<p align="center">A WebGPU engine that runs small language and speech models in a browser tab, built to survive iPhone Safari.</p>
+<p align="center">A WebGPU engine that runs small language, omni and speech models in a browser tab, built to survive iPhone Safari.</p>
 
 <p align="center"><a href="#quick-start">Quick start</a> · <a href="docs/design.md">Design doc</a> · <a href="bench/">Benchmarks and checks</a></p>
 
