@@ -1491,3 +1491,66 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let u = clamp(0.7978845608028654 * (x + 0.044715 * x * x * x), -15.0, 15.0);
   X[i] = 0.5 * x * (2.0 - 2.0 / (exp(2.0 * u) + 1.0));
 }`;
+
+/**
+ * conv1d for stride 1 (same uniforms and bindings): each workgroup stages a window of 16 input channels once and
+ * reuses it for every tap, so X is read about once instead of K times and the inner loop has no div/mod.
+ * Window 64 + (K-1)·d must fit in 192 (K 11, d 5 is 114).
+ */
+export const conv1dWin = /* wgsl */ `
+struct P { OC: u32, IC: u32, K: u32, T: u32, L: u32, s: u32, pad: u32, d: u32,
+  xOff: u32, yOff: u32, bias: u32, p0: u32, alpha: f32, beta: f32, slope: f32, p1: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read> X: array<f32>;
+@group(0) @binding(3) var<storage, read> B: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+var<workgroup> As: array<f32, 1024>;
+var<workgroup> Xs: array<f32, 3072>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let tx = lid.x; let ty = lid.y; let tid = ty * 16u + tx;
+  let n0 = wid.x * 64u; let m0 = wid.y * 64u;
+  let win = 64u + (p.K - 1u) * p.d;
+  let KK = p.IC * p.K;
+  var acc: array<f32, 16>;
+  for (var cb = 0u; cb < p.IC; cb += 16u) {
+    for (var e = tid; e < 16u * win; e += 256u) {
+      let c = e / win; let x = e - c * win;
+      let ti = i32(n0 + x) - i32(p.pad);
+      var b = 0.0;
+      if (cb + c < p.IC && ti >= 0 && ti < i32(p.T)) { b = X[p.xOff + (cb + c) * p.T + u32(ti)]; b = select(b * p.slope, b, b > 0.0); }
+      Xs[c * 192u + x] = b;
+    }
+    for (var k = 0u; k < p.K; k++) {
+      for (var r = 0u; r < 4u; r++) {
+        let e = tid + r * 256u;
+        let m = e >> 4u; let c = e & 15u;
+        var a = 0.0;
+        if (m0 + m < p.OC && cb + c < p.IC) { a = W[(m0 + m) * KK + (cb + c) * p.K + k]; }
+        As[c * 64u + m] = a;
+      }
+      workgroupBarrier();
+      let sh = k * p.d;
+      for (var c = 0u; c < 16u; c++) {
+        var av: array<f32, 4>; var bv: array<f32, 4>;
+        for (var i = 0u; i < 4u; i++) { av[i] = As[c * 64u + ty + 16u * i]; bv[i] = Xs[c * 192u + tx + 16u * i + sh]; }
+        for (var i = 0u; i < 4u; i++) { for (var j = 0u; j < 4u; j++) { acc[i * 4u + j] += av[i] * bv[j]; } }
+      }
+      workgroupBarrier();
+    }
+  }
+  for (var i = 0u; i < 4u; i++) {
+    let m = m0 + ty + 16u * i;
+    if (m >= p.OC) { continue; }
+    for (var j = 0u; j < 4u; j++) {
+      let n = n0 + tx + 16u * j;
+      if (n >= p.L) { continue; }
+      var v = acc[i * 4u + j];
+      if (p.bias == 1u) { v += B[m]; }
+      let o = p.yOff + m * p.L + n;
+      if (p.beta != 0.0) { v += p.beta * Y[o]; }
+      Y[o] = p.alpha * v;
+    }
+  }
+}`;
