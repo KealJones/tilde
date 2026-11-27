@@ -8,7 +8,7 @@ A phone's browser tab is a hostile place for a 1 GB model. iOS gives the whole t
 JavaScript, WebAssembly and every GPU buffer, and kills it (Jetsam) the moment it goes over
 ([measured on an iPhone 16](https://github.com/KealJones/lm-experiments/blob/main/experiments/memcap/README.md); WebKit's engineers on
 the OS limit: [bug 268816](https://bugs.webkit.org/show_bug.cgi?id=268816)). WebKit drops the GPU if one command buffer
-runs past about **3 seconds** ([WebKit's watchdog](https://github.com/WebKit/WebKit/blob/main/Source/WebGPU/WebGPU/Queue.mm#L492-L494),
+runs past about **3 seconds** ([WebKit's watchdog](https://github.com/WebKit/WebKit/blob/main/Source/WebGPU/WebGPU/Queue.mm),
 which logs "did not complete within 3s timeout"; the same crash in
 [onnxruntime#33753](https://github.com/microsoft/onnxruntime/issues/33753)). Most browser runtimes hope to stay under
 those lines. Tilde is built around them.
@@ -28,6 +28,15 @@ video with its sound, audio in, its own voice out), Qwen3 0.6B and the Kokoro-82
 | Memory the engine holds | **1,065–1,092 MB** at a 4K context, every byte counted |
 | Load from cache | **~4–6 s** |
 | Matches llama.cpp | same top 5 and **12/12 identical greedy tokens** on the same prompt |
+
+Reading a reply aloud with Kokoro-82M, on an iPhone 16 Pro in Safari, Nov 27, 2026. Before Tilde ran it, the voice came
+from [kokoro-js](https://www.npmjs.com/package/kokoro-js) 1.2.1 (ONNX Runtime Web):
+
+| Kokoro-82M on the iPhone | What happened |
+|---|---|
+| kokoro-js on WebGPU | spoke one sentence at about real time, then **Safari's GPU process crashed** |
+| kokoro-js on WebAssembly (q8) | slower than real time, **5–16 s of silence** between sentences |
+| **Tilde** | first sound in **0.7 s**, **~4× faster than real time**, a 17-sentence reply in 9 pieces with **no join over 50 ms** |
 
 - **Never holds the whole file.** Weights arrive by HTTP range request, tensor by tensor, get repacked into the GPU
   layout in one small reused staging buffer, and are dropped. Peak memory while loading is the GPU weights so far plus

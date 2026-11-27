@@ -120,7 +120,7 @@ by design.
 
 - **GPU watchdog.** From iOS 27.2.1 on, WebLLM lost the GPU on a plain "Hi" (a ~1,000-token prompt). It queues its
   256-token prefill pieces without waiting, ~2.5 s each, and WebKit kills the GPU process when a command buffer
-  waits more than [3 s](https://github.com/WebKit/WebKit/blob/main/Source/WebGPU/WebGPU/Queue.mm#L492-L494).
+  waits more than [3 s](https://github.com/WebKit/WebKit/blob/main/Source/WebGPU/WebGPU/Queue.mm).
   Squiggle cuts the pieces to 128 tokens and syncs between them by reaching into WebLLM's pipeline
   ([61ad3b4](https://github.com/KealJones/squiggle/commit/61ad3b4)). Tilde sizes every submit ahead of time from
   per-batch-size measurements instead.
