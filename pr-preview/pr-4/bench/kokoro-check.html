@@ -103,15 +103,16 @@ async function loadReal(gpu, frac) {
 const el = Object.assign(new Audio(), { preload: 'auto' });
 const url = (pcm) => URL.createObjectURL(new Blob([wav(pcm, 24000)], { type: 'audio/wav' }));
 
-// Kokoro pads each clip with silence; keep 30 ms before the speech and 150 ms after (a natural pause).
-// shortcut: fixed threshold at 2% of the clip's peak, revisit if quiet voices lose their first sound.
+// Kokoro pads each clip with silence; keep 30 ms before the speech and 250 ms after (a natural pause,
+// and room for a word that fades out quietly).
+// shortcut: fixed threshold at 1% of the clip's peak, revisit if quiet voices lose their first sound.
 function trim(pcm) {
-  const thr = 0.02 * pcm.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+  const thr = 0.01 * pcm.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
   let a = 0, b = pcm.length - 1;
   while (a < b && Math.abs(pcm[a]) < thr) a++;
   while (b > a && Math.abs(pcm[b]) < thr) b--;
   const lead = a / 24, tail = (pcm.length - 1 - b) / 24;
-  return { pcm: pcm.subarray(Math.max(0, a - 720), Math.min(pcm.length, b + 3600)), lead, tail };
+  return { pcm: pcm.subarray(Math.max(0, a - 720), Math.min(pcm.length, b + 6000)), lead, tail };
 }
 
 function playButton(pcm) {
@@ -164,21 +165,22 @@ async function longCheck(gpu) {
   live.hidden = false;
   live.onclick = async () => {
     live.disabled = true;
-    // Two players: the next chunk loads into the idle one while the current one plays. Switching players
-    // takes ~110 ms on an iPhone, so the next one starts 120 ms before the current one ends; that lands in
-    // the 150 ms of trailing silence each clip keeps, so nothing overlaps that you'd hear.
+    // Three players: one plays, the next chunk loads into another, and the third is left alone to finish.
+    // Switching players takes ~110 ms on an iPhone, so the next one starts 120 ms before the current one
+    // ends; that lands in the 250 ms of trailing silence each clip keeps, and the ending clip keeps playing
+    // to its end (with two players, loading the next chunk cut off the clip still ending).
     const LEAD = 120;
-    const els = [el, Object.assign(new Audio(), { preload: 'auto' })];
+    const els = [el, Object.assign(new Audio(), { preload: 'auto' }), Object.assign(new Audio(), { preload: 'auto' })];
     for (const e of els) { e.onended = null; e.src = url(new Float32Array(240)); e.play().catch((x) => log('play failed', x.message)); } // unlock both inside the tap
     const queue = [], durs = [], gapsMs = [];
     let cur = -1, playing = false, started = 0, dur = 0, timer = 0;
-    const preload = () => { if (queue[0]) { const idle = els[(cur + 1) % 2]; idle.src = queue[0].u; idle.load(); } };
+    const preload = () => { if (queue[0]) { const idle = els[(cur + 1) % 3]; idle.src = queue[0].u; idle.load(); } };
     const next = () => {
       clearTimeout(timer);
       const q = queue.shift();
       playing = !!q;
       if (!q) return;
-      cur = (cur + 1) % 2;
+      cur = (cur + 1) % 3;
       const e = els[cur];
       if (e.src !== q.u) e.src = q.u;
       e.onplaying = () => {
