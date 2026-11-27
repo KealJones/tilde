@@ -1554,3 +1554,76 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     }
   }
 }`;
+
+/**
+ * Stride-1 conv1d like conv1dWin, with the accumulators in vec4 registers (no dynamically indexed arrays, which
+ * WebKit's Metal backend can leave in memory). Each thread owns 4 output channels × `cols` (4 or 8) contiguous
+ * steps, so a workgroup covers 64 channels × 16·cols steps. Dispatch [ceil(L / (16·cols)), ceil(OC / 64)].
+ */
+export const conv1dRegSrc = (cols) => {
+  const nv = cols / 4, tile = 16 * cols;
+  const accs = [...Array(4 * nv)].map((_, i) => `var a${i} = vec4<f32>(0.0);`).join(' ');
+  const bvs = [...Array(nv)].map((_, v) => `let b${v} = vec4<f32>(Xs[xb + ${4 * v}u], Xs[xb + ${4 * v + 1}u], Xs[xb + ${4 * v + 2}u], Xs[xb + ${4 * v + 3}u]);`).join('\n        ');
+  const fmas = [...Array(4)].map((_, i) => [...Array(nv)].map((_, v) => `a${i * nv + v} += av.${'xyzw'[i]} * b${v};`).join(' ')).join('\n        ');
+  const outs = [...Array(4)].map((_, i) => [...Array(nv)].map((_, v) => `out(m0 + ty * 4u + ${i}u, n0 + tx * ${cols}u + ${4 * v}u, a${i * nv + v});`).join(' ')).join('\n  ');
+  return /* wgsl */ `
+struct P { OC: u32, IC: u32, K: u32, T: u32, L: u32, s: u32, pad: u32, d: u32,
+  xOff: u32, yOff: u32, bias: u32, p0: u32, alpha: f32, beta: f32, slope: f32, p1: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read> X: array<f32>;
+@group(0) @binding(3) var<storage, read> B: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+const XW = ${tile + 64}u;
+var<workgroup> As: array<f32, 1024>;
+var<workgroup> Xs: array<f32, ${16 * (tile + 64)}>;
+fn out(m: u32, n: u32, v: vec4<f32>) {
+  if (m >= p.OC) { return; }
+  var b = 0.0;
+  if (p.bias == 1u) { b = B[m]; }
+  for (var j = 0u; j < 4u; j++) {
+    if (n + j >= p.L) { return; }
+    let o = p.yOff + m * p.L + n + j;
+    var y = v[j] + b;
+    if (p.beta != 0.0) { y += p.beta * Y[o]; }
+    Y[o] = p.alpha * y;
+  }
+}
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let tx = lid.x; let ty = lid.y; let tid = ty * 16u + tx;
+  let n0 = wid.x * ${tile}u; let m0 = wid.y * 64u;
+  let win = ${tile}u + (p.K - 1u) * p.d;
+  let KK = p.IC * p.K;
+  ${accs}
+  for (var cb = 0u; cb < p.IC; cb += 16u) {
+    for (var e = tid; e < 16u * win; e += 256u) {
+      let c = e / win; let x = e - c * win;
+      let ti = i32(n0 + x) - i32(p.pad);
+      var b = 0.0;
+      if (cb + c < p.IC && ti >= 0 && ti < i32(p.T)) { b = X[p.xOff + (cb + c) * p.T + u32(ti)]; b = select(b * p.slope, b, b > 0.0); }
+      Xs[c * XW + x] = b;
+    }
+    for (var k = 0u; k < p.K; k++) {
+      for (var r = 0u; r < 4u; r++) {
+        let e = tid + r * 256u;
+        let m = e >> 4u; let c = e & 15u;
+        var a = 0.0;
+        if (m0 + m < p.OC && cb + c < p.IC) { a = W[(m0 + m) * KK + (cb + c) * p.K + k]; }
+        As[c * 64u + m] = a;
+      }
+      workgroupBarrier();
+      let sh = k * p.d;
+      for (var c = 0u; c < 16u; c++) {
+        let ab = c * 64u + ty * 4u;
+        let av = vec4<f32>(As[ab], As[ab + 1u], As[ab + 2u], As[ab + 3u]);
+        let xb = c * XW + tx * ${cols}u + sh;
+        ${bvs}
+        ${fmas}
+      }
+      workgroupBarrier();
+    }
+  }
+  ${outs}
+}`;
+};
