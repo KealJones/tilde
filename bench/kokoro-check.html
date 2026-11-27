@@ -120,61 +120,87 @@ function playButton(pcm) {
   btn.onclick = () => { el.onended = null; el.src = url(pcm); el.play().catch((e) => log('play failed', e.message)); };
 }
 
+// Group sentences into chunks so Kokoro carries its intonation across sentences instead of starting
+// over at each one. The first chunk is one sentence (fast first sound); each later chunk may be up to
+// 3× the one before, since synthesis runs ~4× faster than playback, so it's ready before that one ends.
+function chunk(sents, max = 250) {
+  const out = [];
+  let prev = 0;
+  for (const s of sents) {
+    const last = out.at(-1), cap = Math.min(max, 3 * prev);
+    if (last && out.length > 1 && last.length + 1 + s.length <= cap) out[out.length - 1] = last + ' ' + s;
+    else { if (last) prev = last.length; out.push(s); }
+  }
+  return out;
+}
+
 async function longCheck(gpu) {
   const sents = await (await fetch('fixtures/kokoro-long.json')).json();
+  const parts = qs.has('sentences') ? sents : chunk(sents);
   const k = await loadReal(gpu, 0.3);
   const voice = qs.get('voice') || k.defaultVoice;
-  // Play each sentence as soon as it's made, after the one before ends: the silence before sentence i is
-  // how far its synthesis ran past the end of sentence i - 1.
+  log(`${sents.length} sentences in ${parts.length} chunks of ${parts.map((p) => p.length).join(', ')} phonemes`);
+  // Play each chunk as soon as it's made, after the one before ends: the silence before chunk i is
+  // how far its synthesis ran past the end of chunk i - 1.
   const pcms = [], gaps = [], t0 = performance.now();
   let playEnd = 0, first = 0;
-  for (let i = 0; i < sents.length; i++) {
-    mark(`Speaking sentence ${i + 1} of ${sents.length}`, 0.3 + 0.7 * i / sents.length);
+  for (let i = 0; i < parts.length; i++) {
+    mark(`Speaking chunk ${i + 1} of ${parts.length}`, 0.3 + 0.7 * i / parts.length);
     const t1 = performance.now();
-    const { pcm, lead, tail } = trim(await k.speak(sents[i], { voice }));
+    const { pcm, lead, tail } = trim(await k.speak(parts[i], { voice }));
     const ready = (performance.now() - t0) / 1000, dur = pcm.length / 24000;
     if (i === 0) first = playEnd = ready; else gaps.push(Math.max(0, ready - playEnd));
     playEnd = Math.max(playEnd, ready) + dur;
     pcms.push(pcm);
-    log(`${i + 1}: ${sents[i].length} phonemes, ${Math.round(performance.now() - t1)} ms for ${dur.toFixed(2)} s` + (i ? `, silence before it ${gaps[i - 1].toFixed(2)} s` : ''), JSON.stringify(k.times), `padding trimmed: ${Math.round(lead)} ms before, ${Math.round(tail)} ms after`);
+    log(`${i + 1}: ${parts[i].length} phonemes, ${Math.round(performance.now() - t1)} ms for ${dur.toFixed(2)} s` + (i ? `, silence before it ${gaps[i - 1].toFixed(2)} s` : ''), JSON.stringify(k.times), `padding trimmed: ${Math.round(lead)} ms before, ${Math.round(tail)} ms after`);
   }
   const all = new Float32Array(pcms.reduce((a, p) => a + p.length, 0));
   pcms.reduce((o, p) => (all.set(p, o), o + p.length), 0);
   const total = gaps.reduce((a, b) => a + b, 0);
-  log(`first sentence after ${first.toFixed(2)} s; silence between sentences: total ${total.toFixed(2)} s, worst ${Math.max(...gaps).toFixed(2)} s, ${gaps.filter((g) => g > 0.05).length} of ${gaps.length} gaps over 50 ms`);
+  log(`first sound after ${first.toFixed(2)} s; silence between chunks: total ${total.toFixed(2)} s, worst ${Math.max(0, ...gaps).toFixed(2)} s, ${gaps.filter((g) => g > 0.05).length} of ${gaps.length} gaps over 50 ms`);
   playButton(all);
-  // Speak it again, each sentence playing as soon as it's made (what voice mode does).
+  // Speak it again, each chunk playing as soon as it's made (what voice mode does).
   const live = document.getElementById('live');
   live.hidden = false;
   live.onclick = async () => {
     live.disabled = true;
-    // Two players: the next sentence loads into the idle one while the current one plays, so the
-    // hand-off on 'ended' is just play(), not a fresh load.
+    // Two players: the next chunk loads into the idle one while the current one plays. Switching players
+    // takes ~110 ms on an iPhone, so the next one starts 120 ms before the current one ends; that lands in
+    // the 150 ms of trailing silence each clip keeps, so nothing overlaps that you'd hear.
+    const LEAD = 120;
     const els = [el, Object.assign(new Audio(), { preload: 'auto' })];
     for (const e of els) { e.onended = null; e.src = url(new Float32Array(240)); e.play().catch((x) => log('play failed', x.message)); } // unlock both inside the tap
-    const queue = [];
-    let cur = -1, playing = false, endedAt = 0;
-    const hand = [];
+    const queue = [], durs = [], gapsMs = [];
+    let cur = -1, playing = false, started = 0, dur = 0, timer = 0;
+    const preload = () => { if (queue[0]) { const idle = els[(cur + 1) % 2]; idle.src = queue[0].u; idle.load(); } };
     const next = () => {
-      const u = queue.shift();
-      playing = !!u;
-      if (!u) return;
+      clearTimeout(timer);
+      const q = queue.shift();
+      playing = !!q;
+      if (!q) return;
       cur = (cur + 1) % 2;
       const e = els[cur];
-      if (e.src !== u) e.src = u;
-      e.onplaying = () => { if (endedAt) hand.push(performance.now() - endedAt); e.onplaying = null; };
+      if (e.src !== q.u) e.src = q.u;
+      e.onplaying = () => {
+        e.onplaying = null;
+        const now = performance.now();
+        if (started) gapsMs.push(now - started - dur * 1000); // past the clip's own end; ~0 means seamless
+        started = now; dur = q.dur;
+        timer = setTimeout(() => { if (queue[0]) next(); }, Math.max(0, dur * 1000 - LEAD));
+      };
       e.play().catch((x) => log('play failed', x.message));
-      if (queue[0]) { els[(cur + 1) % 2].src = queue[0]; els[(cur + 1) % 2].load(); }
+      preload();
     };
-    for (const e of els) e.onended = () => { if (e === els[cur]) { endedAt = performance.now(); next(); } };
-    for (let i = 0; i < sents.length; i++) {
-      mark(`Live: making sentence ${i + 1} of ${sents.length}`, (i + 1) / sents.length);
-      queue.push(url(trim(await k.speak(sents[i], { voice })).pcm));
+    for (const e of els) e.onended = () => { if (e === els[cur]) next(); };
+    for (let i = 0; i < parts.length; i++) {
+      mark(`Live: making chunk ${i + 1} of ${parts.length}`, (i + 1) / parts.length);
+      const pcm = trim(await k.speak(parts[i], { voice })).pcm;
+      queue.push({ u: url(pcm), dur: pcm.length / 24000 });
       if (!playing) next();
-      else if (queue.length === 1) { const idle = els[(cur + 1) % 2]; idle.src = queue[0]; idle.load(); }
+      else if (queue.length === 1) preload();
     }
     await new Promise((r) => { const t = setInterval(() => { if (!playing) { clearInterval(t); r(); } }, 200); });
-    log(`live hand-offs (end of one clip to the next one sounding): ${hand.map((h) => Math.round(h)).join(', ')} ms`);
+    log(`live hand-offs, how far each clip started past the end of the one before (negative = early, inside its trailing silence): ${gapsMs.map((h) => Math.round(h)).join(', ')} ms`);
     mark('Live: all made', 1);
     live.disabled = false;
   };
