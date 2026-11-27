@@ -1,6 +1,6 @@
 # Tilde design
 
-Tilde runs small language, omni and speech models in a browser tab on WebGPU, built to survive iPhone Safari. iOS kills a tab
+Tilde runs small AI models (text, pictures, video, audio and speech) in a browser tab on WebGPU, built to survive iPhone Safari. iOS kills a tab
 that uses too much memory (Jetsam) or keeps the GPU busy too long; Tilde is built around both limits instead of
 hoping to stay under them.
 
