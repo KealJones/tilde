@@ -1,0 +1,49 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilde: Omni image check</title>
+<div id="kbar" style="position:sticky;top:0;background:#2a78d6;color:#fff;padding:10px;font:15px -apple-system,sans-serif;border-radius:8px;margin-bottom:8px">Tilde: starting…</div>
+<pre id="log" style="white-space:pre-wrap;font:12px ui-monospace,monospace"></pre>
+<script>
+// Optional phone-relay attachment (see demo/index.html).
+(() => {
+  const r = new URLSearchParams(location.search).get('relay');
+  try { const u = new URL(r); if (u.origin === 'https://phone-relay.kealjones.workers.dev' && u.pathname === '/agent.js') { const s = document.createElement('script'); s.src = u.href; document.head.append(s); } } catch {}
+})();
+</script>
+<script type="module">
+// Omni on a real device: chat() with bench/fixtures/test256.png, greedy, compared with llama.cpp's reply
+// ("The image shows the front page of The"; token ids 597 4145 3926 278 4248 4237 302 440).
+import { Tilde } from '../src/index.js';
+const HF = 'https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/main/';
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const bar = (s) => { document.getElementById('kbar').textContent = 'Tilde: ' + s; };
+const want = [597, 4145, 3926, 278, 4248, 4237, 302, 440];
+window.__log = log;
+try {
+  const t0 = performance.now();
+  const llm = await Tilde.load(HF + 'LFM3-Omni-2B-Q4_0.gguf', {
+    mmproj: HF + 'mmproj-LFM3-Omni-2B-Q8_0.gguf', ctx: 2048,
+    onProgress: ({ loaded, total }) => { window.__progress = `${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`; bar('loading Omni ' + window.__progress + ' (keep Safari open)'); },
+  });
+  window.tilde = llm;
+  log('loaded in', ((performance.now() - t0) / 1000).toFixed(1), 's', JSON.stringify(llm.stats()));
+  const bmp = await createImageBitmap(await (await fetch('fixtures/test256.png')).blob());
+  const c = new OffscreenCanvas(bmp.width, bmp.height); const cx = c.getContext('2d'); cx.drawImage(bmp, 0, 0);
+  const image = cx.getImageData(0, 0, bmp.width, bmp.height);
+  const ids = [];
+  const t1 = performance.now();
+  let tFirst = 0;
+  const text = await llm.chat([{ role: 'user', content: [{ type: 'image', image }, 'What is in this image? Answer in one sentence.'] }], {
+    thinking: false, temperature: 0, repeatPenalty: 1, maxTokens: 40,
+    onToken: (p, id) => { if (!ids.length) tFirst = performance.now(); ids.push(id); },
+    onStatus: (s) => bar(s + '…') || log(s, ((performance.now() - t1) / 1000).toFixed(2) + 's', JSON.stringify(llm.stats())),
+  });
+  const match = want.every((t, i) => ids[i] === t);
+  log('reply', JSON.stringify(text));
+  log('first 8 ids', ids.slice(0, 8).join(' '), match ? 'MATCH llama.cpp' : 'DIFFER from llama.cpp ' + want.join(' '));
+  log('first token', ((tFirst - t1) / 1000).toFixed(2), 's,', (ids.length / ((performance.now() - tFirst) / 1000)).toFixed(1), 'tok/s', JSON.stringify(llm.stats()));
+  bar(match ? 'done, matches llama.cpp ✓' : 'done, differs from llama.cpp (see log)');
+  window.__result = { ok: match, text };
+} catch (e) { bar('error: ' + e.message); log('ERROR', e.stack || e); window.__result = { ok: false, error: String(e) }; }
+</script>

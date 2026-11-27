@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tilde</title>
+<style>
+  :root { color-scheme: light dark; font-family: -apple-system, system-ui, sans-serif; }
+  body { margin: 0; padding: max(12px, env(safe-area-inset-top)) 14px 14px; max-width: 760px; margin-inline: auto; }
+  h1 { font-size: 20px; margin: 4px 0 2px; }
+  .tag { color: GrayText; font-size: 13px; margin: 0 0 12px; }
+  input, textarea, button, select { font: inherit; font-size: 16px; }
+  input, textarea, select { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 8px; border: 1px solid #8886; }
+  button { padding: 8px 14px; border-radius: 8px; border: 1px solid #8888; background: none; }
+  .row { display: flex; gap: 8px; margin: 8px 0; align-items: center; }
+  .row > :first-child { flex: 1; }
+  #bar { height: 6px; background: #8883; border-radius: 3px; overflow: hidden; margin: 6px 0; }
+  #bar > div { height: 100%; width: 0; background: #2a78d6; }
+  #out { white-space: pre-wrap; border: 1px solid #8886; border-radius: 8px; padding: 10px; min-height: 120px; margin-top: 8px; }
+  .think { color: GrayText; }
+  #stats { font: 12px ui-monospace, monospace; color: GrayText; white-space: pre-wrap; margin-top: 8px; }
+</style>
+<h1>Tilde</h1>
+<p class="tag">LFM3 on WebGPU, streamed straight into GPU memory.</p>
+
+<div class="row">
+  <select id="model">
+    <option value="https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-QAD-Q4_0.gguf">LFM3 1.7B QAD Q4_0 (1.05 GB)</option>
+    <option value="https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/main/LFM3-Omni-2B-Q4_0.gguf" data-mmproj="https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/main/mmproj-LFM3-Omni-2B-Q8_0.gguf">LFM3 Omni 2B Q4_0 + vision + hearing (1.05 GB; encoders load per use)</option>
+  </select>
+  <button id="load">Load</button>
+</div>
+<div class="row"><label style="flex:0">Context</label><input id="ctx" type="number" value="4096" step="1024" min="1024" style="width:110px;flex:0"></div>
+<div id="bar"><div></div></div>
+<div class="row"><textarea id="prompt" rows="3" placeholder="Say something">What's the capital of France? One sentence.</textarea></div>
+<div class="row" id="photoRow" hidden><label style="flex:0;white-space:nowrap"><input id="photo" type="file" accept="image/*,audio/*,video/*" style="width:auto"></label><button id="rec" style="flex:0;white-space:nowrap">🎤 Record</button><img id="thumb" alt="" style="max-height:56px;border-radius:6px;flex:0" hidden><span id="audioTag" class="tag" style="margin:0;flex:0;white-space:nowrap"></span>
+  <select id="detail" style="width:auto;flex:0" title="Image detail: more detail is slower">
+    <option value="65536">low detail (64 tokens)</option>
+    <option value="147456">medium (144 tokens)</option>
+    <option value="262144" selected>high (256 tokens)</option>
+  </select></div>
+<div class="row"><label style="flex:0;white-space:nowrap"><input id="thinking" type="checkbox" checked style="width:auto"> thinking</label><label id="voiceRow" hidden style="flex:0;white-space:nowrap"><input id="aloud" type="checkbox" style="width:auto"> say replies out loud</label><span id="status" class="tag" style="margin:0"></span><button id="speakBtn" hidden>🔊 Say this</button><button id="send" disabled>Send</button></div>
+<div id="out"></div>
+<div id="stats"></div>
+
+<script>
+// Optional phone-relay attachment for remote testing: ?relay=<agent.js URL>. Only origins listed here may
+// load, since an agent script runs with this page's full access.
+(() => {
+  const RELAY_ORIGINS = ['https://phone-relay.kealjones.workers.dev'];
+  const r = new URLSearchParams(location.search).get('relay');
+  if (!r) return;
+  try {
+    const u = new URL(r);
+    if (!RELAY_ORIGINS.includes(u.origin) || u.pathname !== '/agent.js') return;
+    const s = document.createElement('script');
+    s.src = u.href;
+    document.head.append(s);
+  } catch {}
+})();
+</script>
+<script type="module">
+import { Tilde, decodeAudio, readVideo, SPEECH_RATE } from '../src/index.js';
+
+const $ = (id) => document.getElementById(id);
+const stats = (extra = '') => { $('stats').textContent = (llm ? JSON.stringify(llm.stats(), null, 1) : '') + extra; };
+let llm = null;
+const messages = [];
+window.tilde = { get llm() { return llm; }, messages };
+
+$('load').onclick = async () => {
+  $('load').disabled = true;
+  const t0 = performance.now();
+  try {
+    const opt = $('model').selectedOptions[0];
+    llm = await Tilde.load(opt.value, {
+      ctx: Number($('ctx').value),
+      mmproj: opt.dataset.mmproj,
+      onProgress: ({ loaded, total }) => { $('bar').firstChild.style.width = (100 * loaded / total).toFixed(1) + '%'; $('stats').textContent = `loading ${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`; },
+    });
+    stats(`\nloaded in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+    $('send').disabled = false;
+    $('photoRow').hidden = !opt.dataset.mmproj;
+    $('voiceRow').hidden = $('speakBtn').hidden = !opt.dataset.mmproj;
+  } catch (e) {
+    $('stats').textContent = 'Load failed: ' + (e.stack || e);
+    $('load').disabled = false;
+  }
+};
+
+// Plays streamed 24 kHz PCM chunks back to back.
+let actx = null, playAt = 0;
+function play(pcm) {
+  actx ||= new AudioContext({ sampleRate: SPEECH_RATE });
+  const b = actx.createBuffer(1, pcm.length, SPEECH_RATE);
+  b.copyToChannel(pcm, 0);
+  const src = actx.createBufferSource();
+  src.buffer = b; src.connect(actx.destination);
+  playAt = Math.max(playAt, actx.currentTime + 0.05);
+  src.start(playAt);
+  playAt += b.duration;
+}
+async function say(text) {
+  // Thinking is never read aloud.
+  const spoken = text.split('</think>').pop().trim();
+  if (!spoken) return;
+  actx ||= new AudioContext({ sampleRate: SPEECH_RATE });
+  await actx.resume();
+  const t0 = performance.now();
+  const pcm = await llm.speak(spoken, { onAudio: play, onStatus: (st) => { $('status').textContent = st; } });
+  stats(`\nspoke ${(pcm.length / SPEECH_RATE).toFixed(1)} s of audio in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+}
+$('speakBtn').onclick = async () => {
+  $('speakBtn').disabled = true;
+  try { await say($('prompt').value); } catch (e) { $('out').textContent += '\n[error] ' + (e.stack || e); }
+  $('speakBtn').disabled = false;
+};
+
+let photo = null, audio = null, video = null;
+const setAudio = (pcm) => { audio = pcm; $('audioTag').textContent = pcm ? `🔊 ${(pcm.length / 16000).toFixed(1)} s` : ''; };
+$('photo').onchange = async () => {
+  const f = $('photo').files[0];
+  if (f && f.type.startsWith('audio/')) { setAudio(await decodeAudio(f)); return; }
+  if (f && f.type.startsWith('video/')) {
+    // 2 frames a second, read in pairs; the detail setting caps each frame (low detail: 64 tokens a pair).
+    $('audioTag').textContent = '🎞 reading…';
+    video = await readVideo(f, { maxPixels: Math.min(Number($('detail').value), 256 * 256), maxFrames: 60, onStatus: (s) => { $('audioTag').textContent = '🎞 ' + s; } });
+    $('audioTag').textContent = `🎞 ${video.duration.toFixed(1)} s, ${video.frames.length} frames${video.audio ? ' + sound' : ''}`;
+    return;
+  }
+  photo = f ? await createImageBitmap(f) : null;
+  $('thumb').hidden = !f;
+  if (f) $('thumb').src = URL.createObjectURL(f);
+};
+let recorder = null;
+$('rec').onclick = async () => {
+  if (recorder) { recorder.stop(); return; }
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const chunks = [];
+  recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = (e) => chunks.push(e.data);
+  recorder.onstop = async () => {
+    stream.getTracks().forEach((t) => t.stop());
+    recorder = null;
+    $('rec').textContent = '🎤 Record';
+    setAudio(await decodeAudio(new Blob(chunks, { type: chunks[0]?.type })));
+  };
+  recorder.start();
+  $('rec').textContent = '⏹ Stop';
+};
+
+$('send').onclick = async () => {
+  const text = $('prompt').value.trim();
+  if (!text) return;
+  $('send').disabled = true;
+  if (llm) llm.imageMaxPixels = Number($('detail').value);
+  const parts = [];
+  if (photo) parts.push({ type: 'image', image: photo });
+  if (audio) parts.push({ type: 'audio', audio });
+  if (video) parts.push({ type: 'video', video });
+  messages.push({ role: 'user', content: parts.length ? [...parts, text] : text });
+  photo = null; video = null; $('photo').value = ''; $('thumb').hidden = true; setAudio(null);
+  const out = $('out');
+  out.textContent = '';
+  let n = 0, t0 = 0, tFirst = 0;
+  const tStart = performance.now();
+  try {
+    const reply = await llm.chat(messages, {
+      thinking: $('thinking').checked,
+      onStatus: (st) => { $('status').textContent = st; stats(`\n${st} at ${((performance.now() - tStart) / 1000).toFixed(1)} s`); },
+      onToken: (piece) => {
+        if (!n) { tFirst = performance.now(); t0 = tFirst; }
+        n++;
+        out.textContent += piece;
+        if (n % 4 === 0) stats(`\nfirst token ${((tFirst - tStart) / 1000).toFixed(2)} s, ${(n / ((performance.now() - t0) / 1000)).toFixed(1)} tok/s`);
+      },
+    });
+    messages.push({ role: 'assistant', content: reply });
+    if (!$('aloud').hidden && $('aloud').checked) await say(reply);
+    stats(`\nfirst token ${((tFirst - tStart) / 1000).toFixed(2)} s, ${n} tokens, ${(n / ((performance.now() - t0) / 1000)).toFixed(1)} tok/s`);
+  } catch (e) {
+    out.textContent += '\n[error] ' + (e.stack || e);
+  }
+  $('send').disabled = false;
+};
+</script>

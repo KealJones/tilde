@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tilde API check</title>
+<pre id="log"></pre>
+<script type="module">
+// Loads through the public API (with the download cache), generates greedily, then loads again from cache.
+import { Tilde, clearCache } from '../src/index.js';
+const qs = new URLSearchParams(location.search);
+const url = new URL(qs.get('model') || '/models/LFM3-1.7B-QAD-Q4_0.gguf', location.href).href;
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+try {
+  await clearCache();
+  let t0 = performance.now();
+  let llm = await Tilde.load(url, { ctx: 256, chunk: 8 });
+  log('load (network)', ((performance.now() - t0) / 1000).toFixed(1), 's', JSON.stringify(llm.stats()));
+  t0 = performance.now();
+  const text = await llm.generate('The capital of France is', { temperature: 0, repeatPenalty: 1, maxTokens: 3 });
+  log('generated', JSON.stringify(text), ((performance.now() - t0) / 1000).toFixed(1), 's', 'estimates', JSON.stringify([...llm.model.est]));
+  for (const b of Object.values(llm.model.w)) llm.gpu.free(b.buf);
+  t0 = performance.now();
+  llm = await Tilde.load(url, { ctx: 256, chunk: 8, gpu: llm.gpu });
+  log('load (cache)', ((performance.now() - t0) / 1000).toFixed(1), 's');
+  window.__result = { ok: text === ' Paris, and' };
+} catch (e) { log('ERROR', e.stack || e); window.__result = { ok: false }; }
+</script>

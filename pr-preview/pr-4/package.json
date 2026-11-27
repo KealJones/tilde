@@ -1,0 +1,16 @@
+{
+  "name": "tilde",
+  "version": "0.1.0",
+  "description": "WebGPU engine for small language models that survives iPhone Safari",
+  "type": "module",
+  "main": "src/index.js",
+  "license": "MIT",
+  "repository": "github:KealJones/tilde",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "gpu-test": "node bench/gpu-test.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}

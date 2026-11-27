@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tilde: transcribe then speak (side sequence)</title>
+<pre id="log"></pre>
+<script type="module">
+// The phone check's order: a chat reply, a transcription, then speech, both in the side sequence.
+import { Tilde, parseWav } from '../src/index.js';
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const abs = (p) => new URL(p, location.href).href;
+try {
+  const llm = await Tilde.load(abs('/models/LFM3-Omni-2B-Q4_0.gguf'), { mmproj: abs('/models/mmproj-LFM3-Omni-2B-Q8_0.gguf'), cache: false, ctx: 512, chunk: 64 });
+  await llm.generate('<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n', { maxTokens: 1, temperature: 0 });
+  log('chat ok');
+  const pcm = parseWav(await (await fetch('fixtures/test6.wav')).arrayBuffer()).subarray(0, 16000);
+  log('heard', JSON.stringify(await llm.transcribe(pcm, { maxTokens: 1 })));
+  const out = await llm.speak('Hi.', { maxSeconds: 0.1 });
+  log('spoke', out.length);
+  window.__result = { ok: true };
+} catch (e) { log('ERROR', e.message, e.stack); window.__result = { ok: false }; }
+</script>

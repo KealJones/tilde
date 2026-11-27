@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tilde: LFM3 audio encoder vs llama.cpp</title>
+<pre id="log"></pre>
+<script type="module">
+// Encodes a 16 kHz WAV with the Omni audio encoder and compares the embeddings with llama.cpp's.
+import { openGpu } from '../src/gpu.js';
+import { httpSource, readGGUF } from '../src/gguf.js';
+import { LFM3Audio } from '../src/models/lfm3a.js';
+import { logMel, parseWav } from '../src/audio.js';
+
+const qs = new URLSearchParams(location.search);
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+
+async function refEmbeds(url, E) {
+  const b = await (await fetch(url)).arrayBuffer();
+  const dv = new DataView(b); let p = 0;
+  const i32 = () => { const v = dv.getInt32(p, true); p += 4; return v; };
+  for (let n = i32(), c = 0; c < n; c++) {
+    const type = i32(), len = i32();
+    if (type === 1) return { n: len, e: new Float32Array(b.slice(p, p + len * E * 4)) };
+    p += len * (type === 0 ? 4 : E * 4);
+  }
+}
+
+try {
+  const gpu = await openGpu();
+  const mmSrc = httpSource(qs.get('mmproj') || '/models/mmproj-LFM3-Omni-2B-Q8_0.gguf');
+  const mm = await readGGUF(mmSrc);
+  let t0 = performance.now();
+  const enc = await LFM3Audio.load(gpu, mmSrc, mm);
+  log('audio encoder loaded in', ((performance.now() - t0) / 1000).toFixed(1), 's', JSON.stringify(gpu.report()));
+  const pcm = parseWav(await (await fetch(qs.get('wav') || '/audio/test6.wav')).arrayBuffer());
+  t0 = performance.now();
+  const feats = logMel(pcm);
+  log('mel', feats.frames, 'frames in', (performance.now() - t0).toFixed(0), 'ms');
+  t0 = performance.now();
+  const { buf, tokens } = await enc.encode(feats);
+  log('encoded', tokens, 'tokens in', ((performance.now() - t0) / 1000).toFixed(1), 's');
+  const ref = await refEmbeds(qs.get('ref') || '/ref/aud6.bin', 2048);
+  const ours = new Float32Array(await gpu.read(buf, tokens * 2048 * 4));
+  log('tokens ours', tokens, 'ref', ref.n);
+  const n = Math.min(ours.length, ref.e.length);
+  let cos = 0, na = 0, nb = 0, maxd = 0;
+  for (let i = 0; i < n; i++) { cos += ours[i] * ref.e[i]; na += ours[i] ** 2; nb += ref.e[i] ** 2; maxd = Math.max(maxd, Math.abs(ours[i] - ref.e[i])); }
+  const c = cos / Math.sqrt(na * nb);
+  // Per-token cosine, to spot where a mismatch starts.
+  const per = [];
+  for (let t = 0; t < Math.min(tokens, ref.n); t++) {
+    let d = 0, x = 0, y = 0;
+    for (let k = 0; k < 2048; k++) { const a = ours[t * 2048 + k], b = ref.e[t * 2048 + k]; d += a * b; x += a * a; y += b * b; }
+    per.push((d / Math.sqrt(x * y)).toFixed(3));
+  }
+  log('embeddings vs llama.cpp: cosine', c.toFixed(6), 'max |diff|', maxd.toFixed(4));
+  log('per-token cosine', per.join(' '));
+  window.__result = { ok: tokens === ref.n && c > 0.999 };
+} catch (e) { log('ERROR', e.stack || e); window.__result = { ok: false }; }
+</script>

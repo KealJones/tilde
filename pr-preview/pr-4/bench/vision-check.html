@@ -1,0 +1,75 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tilde: LFM3 vision vs llama.cpp</title>
+<pre id="log"></pre>
+<script type="module">
+// Encodes an image with the Omni vision encoder and compares the embeddings with llama.cpp's.
+// ?full=1 also runs the whole prompt through the backbone and compares logits and greedy tokens.
+import { openGpu } from '../src/gpu.js';
+import { httpSource, readGGUF } from '../src/gguf.js';
+import { LFM3 } from '../src/models/lfm3.js';
+import { LFM3Vision } from '../src/models/lfm3vl.js';
+import { patchify } from '../src/image.js';
+
+const qs = new URLSearchParams(location.search);
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const argmax = (a) => { let b = 0; for (let i = 1; i < a.length; i++) if (a[i] > a[b]) b = i; return b; };
+
+async function readRef(url, E) {
+  const b = await (await fetch(url)).arrayBuffer();
+  const dv = new DataView(b); let p = 0;
+  const i32 = () => { const v = dv.getInt32(p, true); p += 4; return v; };
+  const chunks = [];
+  for (let n = i32(), c = 0; c < n; c++) {
+    const type = i32(), len = i32();
+    if (type === 0) { chunks.push({ tokens: [...new Int32Array(b.slice(p, p + len * 4))] }); p += len * 4; }
+    else { chunks.push({ embeds: new Float32Array(b.slice(p, p + len * E * 4)), n: len }); p += len * E * 4; }
+  }
+  const nv = i32(); const logits = new Float32Array(b.slice(p, p + nv * 4)); p += nv * 4;
+  const ng = i32(); const gen = [...new Int32Array(b.slice(p, p + ng * 4))];
+  return { chunks, logits, gen };
+}
+
+try {
+  const gpu = await openGpu();
+  const mmSrc = httpSource(qs.get('mmproj') || '/models/mmproj-LFM3-Omni-2B-Q8_0.gguf');
+  const mm = await readGGUF(mmSrc);
+  let t0 = performance.now();
+  const vis = await LFM3Vision.load(gpu, mmSrc, mm);
+  log('vision loaded in', ((performance.now() - t0) / 1000).toFixed(1), 's', JSON.stringify(gpu.report()));
+  const bmp = await createImageBitmap(await (await fetch(qs.get('image') || '/ref/test256.png')).blob());
+  const c = new OffscreenCanvas(bmp.width, bmp.height); const cx = c.getContext('2d'); cx.drawImage(bmp, 0, 0);
+  const img = cx.getImageData(0, 0, bmp.width, bmp.height);
+  const pt = patchify(img, vis.cfg);
+  log('image', bmp.width, 'x', bmp.height, '→', pt.width, 'x', pt.height, 'patches', pt.pw * pt.ph);
+  t0 = performance.now();
+  const { buf, tokens } = await vis.encode(pt);
+  log('encoded', tokens, 'tokens in', ((performance.now() - t0) / 1000).toFixed(1), 's', JSON.stringify(gpu.report()));
+  const ours = new Float32Array(await gpu.read(buf, tokens * 2048 * 4));
+  const ref = await readRef(qs.get('ref') || '/ref/vis256.bin', 2048);
+  const want = ref.chunks.find((c) => c.embeds).embeds;
+  let maxd = 0, num = 0, den = 0;
+  for (let i = 0; i < want.length; i++) { const d = ours[i] - want[i]; maxd = Math.max(maxd, Math.abs(d)); num += d * d; den += want[i] * want[i]; }
+  let cos = 0, na = 0, nb = 0; for (let i = 0; i < want.length; i++) { cos += ours[i] * want[i]; na += ours[i] ** 2; nb += want[i] ** 2; }
+  log('embeddings vs llama.cpp: max |diff|', maxd.toFixed(4), 'rel rms', Math.sqrt(num / den).toFixed(5), 'cosine', (cos / Math.sqrt(na * nb)).toFixed(6));
+  vis.free();
+  // llama.cpp quantizes activations to 8-bit on the CPU, so a few % RMS drift is expected; a real bug drops cosine far lower.
+  let ok = cos / Math.sqrt(na * nb) > 0.999;
+  if (qs.get('full')) {
+    const m = await LFM3.load(gpu, httpSource(qs.get('model') || '/models/LFM3-Omni-2B-Q4_0.gguf'), { ctx: 256, chunk: 64 });
+    for (const ch of ref.chunks) {
+      if (ch.tokens) for (let i = 0; i < ch.tokens.length; i += m.chunk) await m.forward(ch.tokens.slice(i, i + m.chunk));
+      else for (let i = 0; i < tokens; i += m.chunk) await m.forwardEmbeds(buf, i, Math.min(m.chunk, tokens - i));
+    }
+    let l = await m.logits();
+    let maxl = 0; for (let i = 0; i < l.length; i++) maxl = Math.max(maxl, Math.abs(l[i] - ref.logits[i]));
+    const gen = [];
+    const nGen = Math.min(Number(qs.get('gen') || 3), ref.gen.length);
+    for (let i = 0; i < nGen; i++) { const t = argmax(l); gen.push(t); if (i + 1 < nGen) { await m.forward([t]); l = await m.logits(); } }
+    log('logits max |diff|', maxl.toFixed(3), 'greedy ours', gen.join(' '), 'ref', ref.gen.slice(0, nGen).join(' '));
+    ok = ok && gen.every((t, i) => t === ref.gen[i]);
+  }
+  gpu.free(buf);
+  window.__result = { ok };
+} catch (e) { log('ERROR', e.stack || e); window.__result = { ok: false }; }
+</script>

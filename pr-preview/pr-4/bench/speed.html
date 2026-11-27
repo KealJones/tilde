@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilde speed</title>
+<div id="kbar" style="position:sticky;top:0;background:#2a78d6;color:#fff;padding:10px;font:15px -apple-system,sans-serif;border-radius:8px;margin-bottom:8px">Tilde speed test: starting…</div>
+<pre id="log" style="white-space:pre-wrap;font:12px ui-monospace,monospace"></pre>
+<script>
+// Optional phone-relay attachment (see demo/index.html).
+(() => {
+  const r = new URLSearchParams(location.search).get('relay');
+  try { const u = new URL(r); if (u.origin === 'https://phone-relay.kealjones.workers.dev' && u.pathname === '/agent.js') { const s = document.createElement('script'); s.src = u.href; document.head.append(s); } } catch {}
+})();
+</script>
+<script type="module">
+// Prompt reading and decode speed for LFM3 1.7B: 256 prompt tokens, then 64 greedy tokens.
+const qs = new URLSearchParams(location.search);
+// ?sha=<commit> loads the engine from jsDelivr pinned to that commit, so a fresh deploy is never shadowed by
+// Safari's 10-minute cache of GitHub Pages files.
+const base = qs.get('sha') ? `https://cdn.jsdelivr.net/gh/KealJones/tilde@${qs.get('sha')}/src/` : '../src/';
+const { Tilde } = await import(base + 'index.js');
+const url = qs.get('model') || 'https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-QAD-Q4_0.gguf';
+const nPrompt = Number(qs.get('prompt') || 256), nGen = Number(qs.get('gen') || 64);
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const bar = (s) => { document.getElementById('kbar').textContent = 'Tilde speed test: ' + s; };
+try {
+  const llm = await Tilde.load(url, { ctx: 2048, onProgress: ({ loaded, total }) => bar(`loading ${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`) });
+  window.tilde = llm;
+  const m = llm.model, tok = llm.tokenizer;
+  if (qs.get('mv')) m.decodeKernel = qs.get('mv');
+  log('decode kernel', m.decodeKernel);
+  const text = 'The history of the ocean is the history of life on Earth. Tides, currents and storms shape coastlines, carry heat from the equator toward the poles, and feed the plankton that sit at the base of almost every food web. '.repeat(12);
+  const ids = tok.encode(text).slice(0, nPrompt);
+  // Warm up the pipelines so compile time is not counted.
+  bar('warming up');
+  await m.forward(ids.slice(0, 8)); await m.forward([ids[8]]); await m.candidates();
+  m.reset();
+  bar(`reading ${ids.length} prompt tokens`);
+  let t0 = performance.now();
+  for (let i = 0; i < ids.length; i += m.chunk) await m.forward(ids.slice(i, i + m.chunk));
+  const prefillMs = performance.now() - t0;
+  const r1 = `prompt: ${ids.length} tokens in ${(prefillMs / 1000).toFixed(2)} s = ${(ids.length / prefillMs * 1000).toFixed(1)} tok/s (chunk now ${m.chunk}, longest submit ${Math.round(llm.gpu.longestSubmit)} ms)`;
+  log(r1);
+  bar(`generating ${nGen} tokens`);
+  let fwd = 0, cand = 0, next;
+  t0 = performance.now();
+  for (let i = 0; i < nGen; i++) {
+    let t = performance.now();
+    const c = await m.candidates(); cand += performance.now() - t;
+    let b = 0; for (let j = 1; j < c.values.length; j++) if (c.values[j] > c.values[b]) b = j;
+    next = c.ids[b];
+    t = performance.now();
+    await m.forward([next]); fwd += performance.now() - t;
+  }
+  const genMs = performance.now() - t0;
+  const r2 = `decode: ${nGen} tokens in ${(genMs / 1000).toFixed(2)} s = ${(nGen / genMs * 1000).toFixed(1)} tok/s (forward ${(fwd / nGen).toFixed(1)} ms + top-k ${(cand / nGen).toFixed(1)} ms per token)`;
+  log(r2);
+  log(JSON.stringify(llm.stats()));
+  bar(`done. ${(ids.length / prefillMs * 1000).toFixed(0)} tok/s reading, ${(nGen / genMs * 1000).toFixed(1)} tok/s writing`);
+  window.__result = { ok: true, r1, r2 };
+} catch (e) { bar('error: ' + e.message); log('ERROR', e.stack || e); window.__result = { ok: false, error: String(e) }; }
+</script>

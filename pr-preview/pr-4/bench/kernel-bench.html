@@ -1,0 +1,118 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilde kernel timings</title>
+<style>
+  body { font: 14px -apple-system, system-ui, sans-serif; margin: 12px; }
+  table { border-collapse: collapse; font-size: 12px; } td, th { padding: 3px 6px; border-bottom: 1px solid #ddd; text-align: right; }
+  td:first-child, th:first-child { text-align: left; } pre { font-size: 11px; white-space: pre-wrap; }
+</style>
+<h3>Tilde kernel timings</h3>
+<p id="status">running…</p>
+<div id="out"></div>
+<pre id="log"></pre>
+<script>
+(() => { // phone relay agent, only when asked for with ?relay=
+  const r = new URLSearchParams(location.search).get('relay');
+  try { const u = new URL(r); if (u.origin === 'https://phone-relay.kealjones.workers.dev' && u.pathname === '/agent.js') { const s = document.createElement('script'); s.src = u.href; document.head.append(s); } } catch {}
+})();
+</script>
+<script type="module">
+// Times each prompt-reading kernel at the real shapes of Qwen3 0.6B and LFM3 1.7B, on whatever GPU opens this page.
+// Each case records `reps` dispatches in one command buffer (well under a second), after one warm-up submit, and
+// reports ms per dispatch; matmuls also in GFLOP/s. Random weights: speed doesn't depend on the values.
+// ?reps=20  ?only=gemm|attn
+import { openGpu } from '../src/gpu.js';
+import * as K from '../src/kernels.js';
+import { repackQ4_0, f32ToF16 } from '../src/quant.js';
+
+// Random Q4_0 blocks (18 bytes: f16 scale, 16 bytes of nibbles). Scale 1/64 written straight as f16 bits.
+function randomQ4_0(rows, Kd) {
+  const blocks = rows * Kd / 32, b = new Uint8Array(blocks * 18);
+  for (let i = 0; i < blocks; i++) {
+    b[i * 18] = 0x00; b[i * 18 + 1] = 0x24; // f16 0x2400 = 1/64
+    for (let j = 0; j < 16; j++) b[i * 18 + 2 + j] = (Math.random() * 256) | 0;
+  }
+  return b;
+}
+
+const qs = new URLSearchParams(location.search);
+const REPS = Number(qs.get('reps')) || 20;
+const log = (...a) => { document.getElementById('log').textContent += a.join(' ') + '\n'; console.log(a.join(' ')); };
+const status = (s) => { document.getElementById('status').textContent = s; };
+const rows = [];
+const table = () => {
+  document.getElementById('out').innerHTML = '<table><tr><th>case</th><th>ms</th><th>GFLOP/s</th></tr>'
+    + rows.map((r) => `<tr><td>${r.name}</td><td>${r.ms.toFixed(3)}</td><td>${r.gflops ? r.gflops.toFixed(0) : ''}</td></tr>`).join('') + '</table>';
+};
+
+try {
+  const gpu = await openGpu();
+  const time = async (name, dispatch, flops = 0) => {
+    await gpu.run((enc) => dispatch(enc)); // warm-up: pipeline compile
+    let reps = REPS;
+    const ms1 = await gpu.run((enc) => dispatch(enc));
+    if (ms1 * reps > 800) reps = Math.max(1, Math.floor(800 / ms1)); // keep the submit far from WebKit's ~3 s limit
+    const ms = (await gpu.run((enc) => { for (let i = 0; i < reps; i++) dispatch(enc); })) / reps;
+    const r = { name, ms, gflops: flops ? flops / ms / 1e6 : 0 };
+    rows.push(r); table(); log(name, ms.toFixed(3), 'ms', r.gflops ? r.gflops.toFixed(0) + ' GFLOP/s' : '');
+    return ms;
+  };
+  const weights = (R, Kd) => {
+    const { qs: q, d, blocks } = repackQ4_0(randomQ4_0(R, Kd));
+    const W = gpu.buffer(blocks * 16 + Math.ceil(blocks / 2) * 4, 'bench');
+    gpu.device.queue.writeBuffer(W, 0, q); gpu.device.queue.writeBuffer(W, blocks * 16, d);
+    return { W, dOff: blocks * 4 };
+  };
+  const filled = (n) => { const b = gpu.buffer(n * 4, 'bench'); gpu.device.queue.writeBuffer(b, 0, Float32Array.from({ length: n }, () => Math.random() - 0.5)); return b; };
+
+  const models = {
+    'Qwen3 0.6B': { mats: { q: [2048, 1024], k: [1024, 1024], v: [1024, 1024], o: [1024, 2048], gate: [3072, 1024], up: [3072, 1024], down: [1024, 3072] }, layers: 28, H: 16, KV: 8 },
+    'LFM3 1.7B': { mats: { 'ffn gate/up': [7680, 2048], 'ffn down': [2048, 7680], 'attn q': [2048, 2048] }, layers: 24, H: 16, KV: 4 },
+  };
+  const summary = {};
+  if (qs.get('only') !== 'attn') {
+    for (const [mname, m] of Object.entries(models)) {
+      for (const T of [64, 256]) {
+        let old = 0, neu = 0;
+        for (const [wname, [R, Kd]] of Object.entries(m.mats)) {
+          status(`${mname} ${wname} T=${T}`);
+          const { W, dOff } = weights(R, Kd);
+          const X = filled(T * Kd), Y = gpu.buffer(T * R * 4, 'bench');
+          const u = new Uint32Array([R, Kd, T, dOff, R, 0, Kd, 0]);
+          const fl = 2 * R * Kd * T;
+          old += await time(`${mname} ${wname} ${R}×${Kd}, ${T} tok: gemmQ4_0`, (enc) => gpu.dispatch(enc, K.gemmQ4_0, [u, W, X, Y], [Math.ceil(R / 64), Math.ceil(T / 32)]), fl);
+          neu += await time(`${mname} ${wname} ${R}×${Kd}, ${T} tok: gemmQ4_0x64`, (enc) => gpu.dispatch(enc, K.gemmQ4_0x64, [u, W, X, Y], [Math.ceil(R / 64), Math.ceil(T / 64)]), fl);
+          for (const b of [W, X, Y]) gpu.free(b);
+        }
+        summary[`${mname} matmuls per layer, ${T} tok`] = { oldMs: +old.toFixed(3), newMs: +neu.toFixed(3) };
+      }
+    }
+  }
+  if (qs.get('only') !== 'gemm') {
+    // Prompt attention, Qwen3 shape (16 query heads over 8 KV heads), 64 new tokens attending to Lk positions.
+    const H = 16, KVH = 8, T = 64, ctx = 4096;
+    const scores = K.attnScoresFor(H, KVH), out = K.attnOutFor(H, KVH, false);
+    const Q = filled(T * H * 128), S = gpu.buffer(T * H * ctx * 4, 'bench'), O = gpu.buffer(T * H * 128 * 4, 'bench');
+    const halves = (n) => { const b = gpu.buffer(n * 4, 'bench'); const h = new Uint16Array(n * 2); for (let i = 0; i < h.length; i++) h[i] = f32ToF16(Math.random() - 0.5); gpu.device.queue.writeBuffer(b, 0, new Uint32Array(h.buffer)); return b; };
+    const KC = halves(ctx * KVH * 64), VC = halves(ctx * KVH * 64); // real f16 pairs (random bits would be NaN/Inf now and then)
+    const flash = K.attnFlashFor(H, KVH, false), flashL = K.attnFlashFor(16, 4, true), G4 = filled(T * 16);
+    for (const Lk of [256, 1024, 3072]) {
+      status(`attention Lk=${Lk}`);
+      const pos0 = Lk - T;
+      const a = await time(`attention scores, Lk ${Lk}`, (enc) => gpu.dispatch(enc, scores, [new Uint32Array([pos0, T, ctx, Lk, 0xffffffff, ctx, 0, 0]), Q, KC, S], [Math.ceil(Lk / 64), T * H]));
+      const b = await time(`attention softmax, Lk ${Lk}`, (enc) => gpu.dispatch(enc, K.softmax, [new Uint32Array([Lk, ctx, 0, 0]), S], T * H));
+      const c = await time(`attention out, Lk ${Lk}`, (enc) => gpu.dispatch(enc, out, [new Uint32Array([Lk, ctx, 0, 0]), S, VC, O], T * H));
+      const fl = 4 * T * H * Lk * 128;
+      const f = await time(`attention fused (attnFlash), Lk ${Lk}`, (enc) => gpu.dispatch(enc, flash, [new Uint32Array([pos0, T, ctx, Lk, 0xffffffff, 0, 0, 0]), Q, KC, VC, O], [Math.ceil(T / 8), KVH]), fl);
+      const fL = await time(`LFM3 attention fused (gated, 4 KV heads), Lk ${Lk}`, (enc) => gpu.dispatch(enc, flashL, [new Uint32Array([pos0, T, ctx, Lk, 0xffffffff, 0, 0, 0]), Q, KC, VC, G4, O], [Math.ceil(T / 4), 4]), fl);
+      summary[`Qwen3 attention per layer, 64 tok at Lk ${Lk}`] = { oldMs: +(a + b + c).toFixed(3), fusedMs: +f.toFixed(3) };
+      summary[`LFM3 attention per layer (fused), 64 tok at Lk ${Lk}`] = { ms: +fL.toFixed(3) };
+    }
+  }
+  const info = gpu.device.adapterInfo || {};
+  window.__result = { ok: true, ua: navigator.userAgent, adapter: [info.vendor, info.architecture].filter(Boolean).join(' '), summary, rows };
+  log(JSON.stringify(summary, null, 1));
+  status('done');
+} catch (e) { log('ERROR', e.stack || e); status('error: ' + e.message); window.__result = { ok: false, error: String(e) }; }
+</script>

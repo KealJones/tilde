@@ -1,0 +1,67 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tilde vs llama.cpp (LFM3, Qwen3)</title>
+<pre id="log"></pre>
+<script type="module">
+import { openGpu } from '../src/gpu.js';
+import { httpSource, readGGUF } from '../src/gguf.js';
+// Any architecture Tilde runs; the model class comes from the GGUF's general.architecture.
+const CLASSES = { lfm3: () => import('../src/models/lfm3.js').then((m) => m.LFM3), qwen3: () => import('../src/models/qwen3.js').then((m) => m.Qwen3) };
+
+const qs = new URLSearchParams(location.search);
+const model = qs.get('model') || '/models/LFM3-1.7B-QAD-Q4_0.gguf';
+const refUrl = qs.get('ref') || '/ref/hello.bin';
+const out = document.getElementById('log');
+const log = (...a) => { const s = a.join(' '); out.textContent += s + '\n'; console.log(s); };
+
+async function readRef(url) {
+  const b = await (await fetch(url)).arrayBuffer();
+  const i = new Int32Array(b);
+  const n = i[0], toks = [...i.subarray(1, 1 + n)], nv = i[1 + n];
+  const logits = new Float32Array(b, (2 + n) * 4, n * nv);
+  const ng = i[2 + n + n * nv], gen = [...i.subarray(3 + n + n * nv, 3 + n + n * nv + ng)];
+  return { toks, nv, last: logits.subarray((n - 1) * nv, n * nv), gen };
+}
+const argmax = (a) => { let b = 0; for (let i = 1; i < a.length; i++) if (a[i] > a[b]) b = i; return b; };
+const topk = (a, k) => [...a.keys()].sort((x, y) => a[y] - a[x]).slice(0, k);
+
+try {
+  const ref = await readRef(refUrl);
+  const gpu = await openGpu();
+  log('adapter', gpu.adapter.info?.vendor, gpu.adapter.info?.architecture);
+  let t0 = performance.now();
+  const src = httpSource(model);
+  const gguf = await readGGUF(src);
+  const arch = gguf.kv['general.architecture'];
+  log('architecture', arch);
+  const chunk = Number(qs.get('chunk')) || 16; // ?chunk=64 exercises the large-batch kernels (gemmQ4_0x64 above 32)
+  const m = await (await CLASSES[arch]()).load(gpu, src, { ctx: 1024, chunk, gguf });
+  log('loaded in', ((performance.now() - t0) / 1000).toFixed(1), 's', JSON.stringify(gpu.report()));
+  t0 = performance.now();
+  for (let i = 0; i < ref.toks.length; i += m.maxChunk) await m.forward(ref.toks.slice(i, i + m.maxChunk));
+  log('prefill', ref.toks.length, 'tokens in', (performance.now() - t0).toFixed(0), 'ms');
+  const l = await m.logits();
+  const cand = await m.candidates();
+  log('GPU top candidate', cand.ids[[...cand.values.keys()].sort((a, b) => cand.values[b] - cand.values[a])[0]], 'argmax', argmax(l));
+  let maxd = 0; for (let i = 0; i < l.length; i++) maxd = Math.max(maxd, Math.abs(l[i] - ref.last[i]));
+  log('last logits: max |diff| vs llama.cpp', maxd.toFixed(4), 'top5 ours', topk(l, 5), 'ref', topk(ref.last, 5));
+  const gen = [];
+  let next = argmax(l);
+  t0 = performance.now();
+  const nGen = Math.min(Number(qs.get('gen') || ref.gen.length), ref.gen.length);
+  for (let i = 0; i < nGen; i++) {
+    gen.push(next);
+    await m.forward([next]);
+    next = argmax(await m.logits());
+  }
+  const ms = performance.now() - t0;
+  log('greedy ours', gen.join(' '));
+  log('greedy ref ', ref.gen.slice(0, nGen).join(' '));
+  const same = gen.every((t, i) => t === ref.gen[i]);
+  log('decode', (ms / gen.length).toFixed(0), 'ms/token', 'match', same, JSON.stringify(gpu.report()));
+  window.__result = { ok: same && maxd < 0.5, maxd, same };
+} catch (e) {
+  log('ERROR', e.stack || e);
+  window.__result = { ok: false, error: String(e) };
+}
+</script>

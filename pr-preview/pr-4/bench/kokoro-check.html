@@ -1,0 +1,130 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilde Kokoro check</title>
+<style>
+  body { font: 15px system-ui, sans-serif; margin: 16px; }
+  #bar { height: 10px; background: #ddd; border-radius: 5px; overflow: hidden; margin: 8px 0; }
+  #bar > div { height: 100%; width: 0; background: #3a7; transition: width .2s; }
+  pre { white-space: pre-wrap; }
+</style>
+<div id="step">Starting…</div>
+<div id="bar"><div></div></div>
+<button id="play" hidden>Play</button>
+<pre id="log"></pre>
+<script type="module">
+// Kokoro on the GPU against the CPU reference (src/ref/kokoro.js).
+//   kokoro-check.html            random weights at the real shapes, a few tokens (SwiftShader-sized)
+//   kokoro-check.html?real       the ggml-org GGUFs: load, speak ?text= (phonemes) with ?voice=, time each stage
+import { openGpu } from '../src/gpu.js';
+import { httpSource } from '../src/gguf.js';
+import { Kokoro, gaussian } from '../src/models/kokoro.js';
+import { KokoroRef } from '../src/ref/kokoro.js';
+
+const qs = new URLSearchParams(location.search);
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const step = (s, frac) => { document.getElementById('step').textContent = s; if (frac !== undefined) document.querySelector('#bar > div').style.width = `${Math.round(frac * 100)}%`; };
+window.__progress = { step: 'start', frac: 0 };
+const mark = (s, frac) => { step(s, frac); window.__progress = { step: s, frac }; };
+
+function maxRel(a, b) {
+  let d = 0, m = 0;
+  for (let i = 0; i < a.length; i++) { d = Math.max(d, Math.abs(a[i] - b[i])); m = Math.max(m, Math.abs(b[i])); }
+  return { d, m, rel: d / Math.max(m, 1e-6) };
+}
+
+async function randomCheck(gpu) {
+  mark('Making random weights', 0.05);
+  const shapes = await (await fetch('fixtures/kokoro-shapes.json')).json();
+  let seed = 1;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 2147483648 - 1; };
+  const weights = {};
+  for (const [name, dims] of shapes) {
+    const n = dims.reduce((a, b) => a * b, 1), data = new Float32Array(n);
+    // conv [K, IC, OC] and matrices [K, rows] fan in over the first two / first dim
+    const fan = dims.length === 3 ? dims[0] * dims[1] : dims.length === 2 ? dims[0] : 1;
+    const sc = dims.length >= 2 ? 1 / Math.sqrt(fan) : 0.1;
+    for (let i = 0; i < n; i++) data[i] = rnd() * sc;
+    if (/\.(gamma|weight)$/.test(name) && dims.length === 1) for (let i = 0; i < n; i++) data[i] += 1;
+    if (/alpha[12]\.\d+$/.test(name)) for (let i = 0; i < n; i++) data[i] = 0.6 + Math.abs(data[i]) * 5;
+    if (/pool\.weight$/.test(name)) for (let i = 0; i < n; i++) data[i] *= 3;
+    weights[name] = { dims, data };
+  }
+  // Exactly 2 frames per token (two bins sure, the rest off), so GPU and CPU durations can't round apart.
+  const dw = weights['a.gen.pred.duration_proj.linear_layer.weight'], db = weights['a.gen.pred.duration_proj.linear_layer.bias'];
+  dw.data.fill(0); db.data.fill(-40); db.data[0] = db.data[1] = 40;
+  const nPh = Number(qs.get('n') || 3), voiceRow = Float32Array.from({ length: 256 }, () => rnd());
+  const tokens = [0, ...Array.from({ length: nPh }, (_, i) => 1 + ((i * 37) % 170)), 0];
+  const kv = { 'kokoro.block_count': 12, 'kokoro.attention.head_count': 12, 'kokoro.attention.layer_norm_epsilon': 1e-12 };
+
+  mark('Uploading', 0.15);
+  const k = await Kokoro.fromWeights(gpu, weights, kv);
+  mark('GPU', 0.25);
+  const t0 = performance.now();
+  const g = await k.synth(tokens, voiceRow, { seed: 7 });
+  log(`GPU: ${Math.round(performance.now() - t0)} ms`, JSON.stringify(k.times));
+  mark('CPU reference', 0.5);
+  const t1 = performance.now();
+  const ref = new KokoroRef((name) => weights[name], (name) => name in weights);
+  const c = ref.speak(tokens, voiceRow, { rng: gaussian(7) });
+  log(`CPU: ${Math.round(performance.now() - t1)} ms`);
+
+  let ok = true;
+  const check = (label, a, b, tol) => {
+    if (a.length !== b.length) { log(`${label}: length ${a.length} vs ${b.length}`, 'FAIL'); ok = false; return; }
+    const r = maxRel(a, b), pass = r.rel <= tol;
+    log(`${label}: max |diff| ${r.d.toExponential(2)} of max ${r.m.toFixed(3)} (rel ${r.rel.toExponential(2)})`, pass ? 'ok' : 'FAIL');
+    ok &&= pass;
+  };
+  log(`durations GPU ${[...g.durations]} CPU ${[...c.durations]}`);
+  ok &&= g.durations.join() === c.durations.join();
+  check('f0', g.f0, c.f0, 2e-3);
+  check('spec', g.spec, c.spec, 2e-3);
+  check('audio', g.audio, c.audio, 5e-3);
+  k.dispose();
+  return ok;
+}
+
+async function realCheck(gpu) {
+  const base = qs.get('base') || 'https://huggingface.co/ggml-org/Kokoro-82M-GGUF/resolve/main/';
+  const t0 = performance.now();
+  mark('Loading Kokoro (270 MB)', 0);
+  const k = await Kokoro.load(gpu, httpSource(base + 'Kokoro-82M-F32.gguf'), httpSource(base + 'mmproj-Kokoro-82M-F16.gguf'), {
+    onProgress: ({ loaded, total }) => mark(`Loading Kokoro: ${Math.round(loaded / 1048576)} of ${Math.round(total / 1048576)} MB`, 0.8 * loaded / total),
+  });
+  log(`load ${Math.round(performance.now() - t0)} ms, ${k.voices.length} voices, GPU`, JSON.stringify(gpu.report()));
+  const text = qs.get('text') || 'həlˈoʊ, ðɪs ɪz tˈɪldə spˈiːkɪŋ ˈɔn ðə ʤˈiːpˌiːjˈuː.';
+  const voice = qs.get('voice') || k.defaultVoice;
+  const runs = [];
+  for (let i = 0; i < Number(qs.get('runs') || 2); i++) {
+    mark(`Speaking (run ${i + 1})`, 0.85 + 0.05 * i);
+    const t1 = performance.now();
+    const pcm = await k.speak(text, { voice });
+    const ms = Math.round(performance.now() - t1);
+    runs.push(ms);
+    log(`run ${i + 1}: ${ms} ms for ${(pcm.length / 24000).toFixed(2)} s of audio`, JSON.stringify(k.times));
+    window.__pcm = pcm;
+  }
+  const pcm = window.__pcm;
+  let peak = 0, rms = 0, nan = 0;
+  for (const v of pcm) { if (Number.isNaN(v)) nan++; else { peak = Math.max(peak, Math.abs(v)); rms += v * v; } }
+  log(`peak ${peak.toFixed(3)}, rms ${Math.sqrt(rms / pcm.length).toFixed(4)}, NaN ${nan}`);
+  const btn = document.getElementById('play');
+  btn.hidden = false;
+  btn.onclick = () => { const ac = new AudioContext(); const b = ac.createBuffer(1, pcm.length, 24000); b.copyToChannel(pcm, 0); const s = ac.createBufferSource(); s.buffer = b; s.connect(ac.destination); s.start(); };
+  window.__stats = { runs, seconds: pcm.length / 24000, peak, nan, times: k.times, report: gpu.report() };
+  return nan === 0 && peak > 0.01 && peak < 10;
+}
+
+try {
+  const gpu = await openGpu();
+  const ok = qs.has('real') ? await realCheck(gpu) : await randomCheck(gpu);
+  mark(ok ? 'Done: all good' : 'Done: something failed', 1);
+  log(ok ? 'PASS' : 'FAIL');
+  window.__result = { ok };
+} catch (e) {
+  log('error', e.stack || e.message);
+  mark(`Error: ${e.message}`, 1);
+  window.__result = { ok: false, error: e.message };
+}
+</script>

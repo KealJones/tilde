@@ -1,0 +1,119 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilde vs wllama</title>
+<div id="kbar" style="position:sticky;top:0;background:#2a78d6;color:#fff;padding:10px;font:15px -apple-system,sans-serif;border-radius:8px;margin-bottom:8px">starting…</div>
+<pre id="log" style="white-space:pre-wrap;font:12px ui-monospace,monospace"></pre>
+<script>
+(() => {
+  const r = new URLSearchParams(location.search).get('relay');
+  try { const u = new URL(r); if (u.origin === 'https://phone-relay.kealjones.workers.dev' && u.pathname === '/agent.js') { const s = document.createElement('script'); s.src = u.href; document.head.append(s); } } catch {}
+})();
+</script>
+<script type="module">
+// Same model, same prompt, same settings, one engine per page load:
+//   ?engine=tilde|wllama  ?prompt=256 (prompt tokens)  ?gen=64  ?ctx=2048  ?sha=<commit> (pin Tilde via jsDelivr)
+// Each stage is also written to localStorage ('vs-wllama'), so if iOS kills the tab the next load shows how far it got.
+const qs = new URLSearchParams(location.search);
+const engine = qs.get('engine') || 'tilde';
+const nPrompt = Number(qs.get('prompt') || 256), nGen = Number(qs.get('gen') || 64), ctx = Number(qs.get('ctx') || 2048);
+const MODEL = 'https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-QAD-Q4_0.gguf';
+const WLLAMA = 'https://cdn.jsdelivr.net/npm/@wllama/wllama@3.13.0/esm/';
+const run = `${engine} p${nPrompt} g${nGen} @${new Date().toISOString()}`;
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const bar = (s) => { document.getElementById('kbar').textContent = `${engine}: ${s}`; };
+const stage = (s, extra = {}) => {
+  bar(s);
+  let all = [];
+  try { all = JSON.parse(localStorage.getItem('vs-wllama') || '[]'); } catch {}
+  all.push({ run, stage: s, t: Math.round(performance.now()), ...extra });
+  try { localStorage.setItem('vs-wllama', JSON.stringify(all.slice(-200))); } catch {}
+};
+let prev = [];
+try { prev = JSON.parse(localStorage.getItem('vs-wllama') || '[]'); if (prev.length) log('previous runs (last 6 stages):\n' + prev.slice(-6).map((e) => JSON.stringify(e)).join('\n')); } catch {}
+// Safari reloads a tab iOS killed; without this a run that kills the tab restarts forever. ?again=1 overrides.
+const last = prev.at(-1);
+if (performance.getEntriesByType('navigation')[0]?.type === 'reload' && last?.run.startsWith(run.split(' @')[0] + ' @')
+    && !['done', 'error', 'died'].includes(last.stage) && !qs.get('again')) {
+  stage('died', { during: last.stage, deadRun: last.run });
+  log(`previous run died during "${last.stage}" (tab killed); not restarting. Add &again=1 to retry.`);
+  window.__result = { ok: false, died: last.stage };
+  throw new Error('previous run died');
+}
+
+// Shared prompt: exactly nPrompt tokens of the same text, built with Tilde's tokenizer (identical to llama.cpp's
+// for this model: tests/tokenizer.test.js), decoded back to a string so both engines get the same text.
+const TEXT = 'The history of the ocean is the history of life on Earth. Tides, currents and storms shape coastlines, carry heat from the equator toward the poles, and feed the plankton that sit at the base of almost every food web. '.repeat(64);
+const base = qs.get('sha') ? `https://cdn.jsdelivr.net/gh/KealJones/tilde@${qs.get('sha')}/src/` : '../src/';
+const kx = await import(base + 'index.js');
+
+const result = { engine, nPrompt, nGen, ctx, ua: navigator.userAgent };
+try {
+  stage('loading');
+  let t0 = performance.now();
+  if (engine === 'tilde') {
+    const llm = await kx.Tilde.load(MODEL, { ctx, onProgress: ({ loaded, total }) => bar(`loading ${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`) });
+    result.loadS = +((performance.now() - t0) / 1000).toFixed(1);
+    const m = llm.model, ids = llm.tokenizer.encode(TEXT).slice(0, nPrompt);
+    stage('loaded', { loadS: result.loadS });
+    // Same warm-up both engines get implicitly: compile pipelines once, then start clean.
+    await m.forward(ids.slice(0, 8)); await m.forward([ids[8]]); await m.candidates(); m.reset();
+    stage('reading prompt');
+    t0 = performance.now();
+    for (let i = 0; i < ids.length; i += m.chunk) await m.forward(ids.slice(i, i + m.chunk));
+    const promptMs = performance.now() - t0;
+    stage('writing');
+    const out = [];
+    t0 = performance.now();
+    for (let i = 0; i < nGen; i++) {
+      const c = await m.candidates();
+      let b = 0; for (let j = 1; j < c.values.length; j++) if (c.values[j] > c.values[b]) b = j;
+      out.push(c.ids[b]);
+      await m.forward([c.ids[b]]);
+    }
+    const genMs = performance.now() - t0;
+    Object.assign(result, {
+      promptTokS: +(ids.length / promptMs * 1000).toFixed(1), genTokS: +(nGen / genMs * 1000).toFixed(1),
+      text: llm.tokenizer.decode(out), ...llm.stats(),
+    });
+  } else {
+    const { Wllama } = await import(WLLAMA + 'index.js');
+    const w = new Wllama({ default: WLLAMA + 'wasm/wllama.wasm' }); // the package's wasm-from-cdn.js isn't published
+    // On iOS Safari 27.2 wllama (3.8.1 and 3.13.0)'s check (new WebAssembly.Memory({ address: 'i64' })) passes but its wasm then fails
+    // to compile ("Memory64 is not enabled"), so it never picks its Safari build. Force that build unless ?compat=0.
+    if (qs.get('compat') !== '0') {
+      const C = 'https://cdn.jsdelivr.net/npm/@wllama/wllama-compat@3.13.0/wasm/';
+      w.getWorkerResources = () => ({ wasmPath: C + 'wllama.wasm', jsPath: C + 'wllama.js', compat: true });
+    }
+    result.compat = qs.get('compat') !== '0';
+    result.webgpu = w.isSupportWebGPU();
+    // Tokenizer only (reads the GGUF header, a few MB, not the weights) so the prompt text matches Tilde's.
+    const hdr = await (await import(base + 'gguf.js')).readGGUF(await kx.cachedSource(kx.httpSource(MODEL), { key: MODEL }));
+    const tok = kx.Tokenizer.fromGGUF(hdr.kv);
+    const text = tok.decode(tok.encode(TEXT).slice(0, nPrompt));
+    await w.loadModelFromUrl(MODEL, { n_ctx: ctx, progressCallback: ({ loaded, total }) => bar(`loading ${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`) });
+    result.loadS = +((performance.now() - t0) / 1000).toFixed(1);
+    result.libllama = Wllama.getLibllamaVersion?.();
+    stage('loaded', { loadS: result.loadS });
+    stage('reading prompt + writing');
+    t0 = performance.now();
+    const r = await w.createCompletion({ prompt: text, max_tokens: nGen, temperature: 0, repeat_penalty: 1 });
+    const wallS = (performance.now() - t0) / 1000;
+    const tm = r.timings || {};
+    Object.assign(result, {
+      promptN: tm.prompt_n, promptTokS: +(tm.prompt_per_second || 0).toFixed(1), genN: tm.predicted_n,
+      genTokS: +(tm.predicted_per_second || 0).toFixed(1), wallS: +wallS.toFixed(1), text: r.choices?.[0]?.text,
+    });
+  }
+  result.ok = true;
+  stage('done', { result });
+  log(JSON.stringify(result, null, 1));
+  bar(`done: ${result.promptTokS} tok/s reading, ${result.genTokS} tok/s writing`);
+} catch (e) {
+  result.ok = false; result.error = String(e?.stack || e);
+  stage('error', { error: String(e) });
+  log('ERROR', result.error);
+  bar('error: ' + (e?.message || e));
+}
+window.__result = result;
+</script>

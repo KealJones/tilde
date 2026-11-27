@@ -1,0 +1,77 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilde: Omni check</title>
+<div id="kbar" style="position:sticky;top:0;background:#2a78d6;color:#fff;padding:10px;font:15px -apple-system,sans-serif;border-radius:8px;margin-bottom:8px">Tilde: starting…</div>
+<pre id="log" style="white-space:pre-wrap;font:12px ui-monospace,monospace"></pre>
+<script>
+(() => {
+  const r = new URLSearchParams(location.search).get('relay');
+  try { const u = new URL(r); if (u.origin === 'https://phone-relay.kealjones.workers.dev' && u.pathname === '/agent.js') { const s = document.createElement('script'); s.src = u.href; document.head.append(s); } } catch {}
+})();
+</script>
+<script type="module">
+// Omni on a real device: ?kind=image (bench/fixtures/test256.png) or ?kind=audio (bench/fixtures/test6.wav),
+// greedy, compared with llama.cpp's first 8 tokens. ?sha=<commit> loads the engine pinned via jsDelivr.
+const qs = new URLSearchParams(location.search);
+const base = qs.get('sha') ? `https://cdn.jsdelivr.net/gh/KealJones/tilde@${qs.get('sha')}/src/` : '../src/';
+const { Tilde, parseWav, wav } = await import(base + 'index.js');
+const HF = 'https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/main/';
+const kind = qs.get('kind') || 'audio';
+const CASES = {
+  image: { prompt: 'What is in this image? Answer in one sentence.', want: [597, 4145, 3926, 278, 4248, 4237, 302, 440] },
+  audio: { prompt: 'Transcribe the audio.', want: [597, 1381, 2791, 9595, 487, 4604, 229, 1696] },
+};
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const bar = (s) => { document.getElementById('kbar').textContent = 'Tilde: ' + s; };
+try {
+  const t0 = performance.now();
+  const llm = await Tilde.load(HF + 'LFM3-Omni-2B-Q4_0.gguf', {
+    mmproj: HF + 'mmproj-LFM3-Omni-2B-Q8_0.gguf', ctx: 2048,
+    onProgress: ({ loaded, total }) => bar(`loading Omni ${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB (keep Safari open)`),
+  });
+  window.tilde = llm;
+  log('loaded in', ((performance.now() - t0) / 1000).toFixed(1), 's', JSON.stringify(llm.stats()));
+  if (kind === 'speak') {
+    const text = qs.get('text') || 'Hey Keal! This is Tilde, speaking from your iPhone, on the GPU, with no server at all.';
+    const t1 = performance.now();
+    let first = 0;
+    const pcm = await llm.speak(text, {
+      onAudio: () => { if (!first) first = performance.now(); },
+      onStatus: (s) => { bar(s + '…'); log(s, ((performance.now() - t1) / 1000).toFixed(2) + 's', JSON.stringify(llm.stats())); },
+    });
+    const secs = (performance.now() - t1) / 1000, audioSecs = pcm.length / 24000;
+    const r = `spoke ${audioSecs.toFixed(1)} s of audio in ${secs.toFixed(1)} s (${(audioSecs / secs).toFixed(2)}× real time), first audio after ${((first - t1) / 1000).toFixed(1)} s`;
+    log(r, JSON.stringify(llm.stats()));
+    const a = document.createElement('audio');
+    a.controls = true; a.src = URL.createObjectURL(new Blob([wav(pcm)], { type: 'audio/wav' }));
+    a.style.cssText = 'width:100%;margin:8px 0';
+    document.getElementById('kbar').after(a);
+    bar('done: tap ▶ to hear it');
+    window.__result = { ok: pcm.length > 0, r };
+    throw 'done';
+  }
+  let part;
+  if (kind === 'image') {
+    const bmp = await createImageBitmap(await (await fetch('fixtures/test256.png')).blob());
+    const c = new OffscreenCanvas(bmp.width, bmp.height); const cx = c.getContext('2d'); cx.drawImage(bmp, 0, 0);
+    part = { type: 'image', image: cx.getImageData(0, 0, bmp.width, bmp.height) };
+  } else {
+    part = { type: 'audio', audio: parseWav(await (await fetch('fixtures/test6.wav')).arrayBuffer()) };
+  }
+  const ids = [];
+  const t1 = performance.now();
+  let tFirst = 0;
+  const text = await llm.chat([{ role: 'user', content: [part, CASES[kind].prompt] }], {
+    thinking: false, temperature: 0, repeatPenalty: 1, maxTokens: 40,
+    onToken: (p, id) => { if (!ids.length) tFirst = performance.now(); ids.push(id); },
+    onStatus: (s) => { bar(s + '…'); log(s, ((performance.now() - t1) / 1000).toFixed(2) + 's', JSON.stringify(llm.stats())); },
+  });
+  const want = CASES[kind].want, match = want.every((t, i) => ids[i] === t);
+  log('reply', JSON.stringify(text));
+  log('first 8 ids', ids.slice(0, 8).join(' '), match ? 'MATCH llama.cpp' : 'DIFFER from llama.cpp ' + want.join(' '));
+  log('first token', ((tFirst - t1) / 1000).toFixed(2), 's,', (ids.length / ((performance.now() - tFirst) / 1000)).toFixed(1), 'tok/s', JSON.stringify(llm.stats()));
+  bar(match ? `done (${kind}), matches llama.cpp ✓` : `done (${kind}), differs from llama.cpp (see log)`);
+  window.__result = { ok: match, text };
+} catch (e) { if (e === 'done') throw e; bar('error: ' + e.message); log('ERROR', e.stack || e); window.__result = { ok: false, error: String(e) }; }
+</script>

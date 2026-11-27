@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tilde: snapshot reuse and side sequence check</title>
+<pre id="log"></pre>
+<script type="module">
+// generate({ snapshotAt }) then a prompt that shares only the snapshot's tokens: it must go back to the snapshot and
+// give the same greedy tokens as reading the prompt from scratch. Then a side sequence runs in between and the main
+// conversation carries on as if it never happened.
+import { Tilde } from '../src/index.js';
+const qs = new URLSearchParams(location.search);
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const abs = (p) => new URL(p, location.href).href;
+const greedy = { temperature: 0, repeatPenalty: 1, maxTokens: Number(qs.get('gen') || 2) };
+try {
+  const llm = await Tilde.load(abs(qs.get('model') || '/models/LFM3-1.7B-QAD-Q4_0.gguf'), { cache: false, ctx: 256, chunk: 64 });
+  const m = llm.model, tk = llm.tokenizer;
+  const bos = tk.tokens[tk.bos];
+  const turn = (q) => `${bos}<|im_start|>user\n${q}<|im_end|>\n<|im_start|>assistant\n<think></think>`;
+  const run = async (p, o = {}) => { const ids = []; let read = null; await llm.generate(p, { ...greedy, ...o, onToken: (_, id) => ids.push(id), onRead: (r) => { read = r; } }); return { ids, read }; };
+  const fresh = async (p) => { m.reset(); llm.history = []; llm.snap = null; return run(p); };
+  const shared = tk.encode(`${bos}<|im_start|>user\nName one`).length;
+  const a = await run(turn('Name one color.'), { snapshotAt: shared });
+  log('A', a.ids.join(' '), JSON.stringify(a.read));
+  const b = await run(turn('Name one fruit.'));
+  log('B after A (snapshot)', b.ids.join(' '), JSON.stringify(b.read));
+  const bf = await fresh(turn('Name one fruit.'));
+  log('B fresh', bf.ids.join(' '));
+  const snapOk = b.read.reused === shared && b.ids.join() === bf.ids.join();
+  // Side sequence in between, then the same conversation carries on (exact-history reuse).
+  const side = m.newSequence(128);
+  const main = m.useSequence(side);
+  m.reset();
+  await m.forward(tk.encode('Some unrelated text that goes through the side sequence.'));
+  side.pos = m.pos;
+  m.useSequence(main);
+  const more = [...llm.history, ...tk.encode('<|im_end|>\n<|im_start|>user\nAnd one more.<|im_end|>\n<|im_start|>assistant\n<think></think>')];
+  const c = await run(more);
+  const cf = await fresh(more);
+  log('C after side sequence', c.ids.join(' '), JSON.stringify(c.read), 'fresh', cf.ids.join(' '));
+  const sideOk = c.read.reused > 0 && c.ids.join() === cf.ids.join();
+  log(snapOk && sideOk ? 'OK' : 'MISMATCH', JSON.stringify({ snapOk, sideOk }), JSON.stringify(llm.stats()));
+  window.__result = { ok: snapOk && sideOk };
+} catch (e) { log('ERROR', e.stack || e); window.__result = { ok: false }; }
+</script>
