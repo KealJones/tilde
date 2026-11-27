@@ -106,7 +106,7 @@ it stays up on iOS 27, needs no compile jobs, reads Liquid's official GGUFs as t
 ## Quick start
 
 ```js
-import { Tilde } from 'https://cdn.jsdelivr.net/gh/KealJones/tilde@a7234e4/src/index.js';
+import { Tilde } from 'https://cdn.jsdelivr.net/gh/KealJones/tilde@ab7fe77/src/index.js';
 
 const llm = await Tilde.load(
   'https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-QAD-Q4_0.gguf',
@@ -137,7 +137,7 @@ const words = await omni.transcribe(micPcm);                       // 16 kHz mon
 Text to speech with Kokoro-82M, a reply read aloud sentence by sentence as each is made:
 
 ```js
-import { loadKokoro, chunkSentences, trimSilence, ClipPlayer } from 'https://cdn.jsdelivr.net/gh/KealJones/tilde@<commit>/src/index.js';
+import { loadKokoro, chunkSentences, trimSilence, ClipPlayer } from 'https://cdn.jsdelivr.net/gh/KealJones/tilde@ab7fe77/src/index.js';
 
 const base = 'https://huggingface.co/ggml-org/Kokoro-82M-GGUF/resolve/main/';
 const kokoro = await loadKokoro(base + 'Kokoro-82M-F32.gguf', base + 'mmproj-Kokoro-82M-F16.gguf');
