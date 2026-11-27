@@ -1,6 +1,6 @@
 # Tilde design
 
-Tilde runs small language models in a browser tab on WebGPU, built to survive iPhone Safari. iOS kills a tab
+Tilde runs small AI models (text, pictures, video, audio and speech) in a browser tab on WebGPU, built to survive iPhone Safari. iOS kills a tab
 that uses too much memory (Jetsam) or keeps the GPU busy too long; Tilde is built around both limits instead of
 hoping to stay under them.
 
@@ -102,6 +102,36 @@ iPhone at ~80% loaded.
   count the next prompt is sure to share; a prompt that starts with those tokens goes back there and reads only the
   rest. Global KV slots up to that point are never written again, so they need no copy. This is what lets a chat
   template that drops the last turn's thinking, or a reply re-tokenized differently, still reuse the prompt.
+
+## Kokoro (text to speech)
+
+Kokoro-82M from ggml-org's GGUFs, ported from llama.cpp (`src/models/kokoro.cpp`, `tools/mtmd/models/kokoro.cpp`):
+an ALBERT encoder over phonemes (one stored layer applied 12 times, 128-wide embeddings projected to 768), then the
+StyleTTS2 prosody predictor and the iSTFTNet decoder from the mmproj. All weights load as f32 (~330 MB of GPU memory);
+a voice is a [510][256] table in the file and one row (picked by the phoneme count) is read per utterance.
+
+- **On the GPU**: the encoder, the text CNN, every LSTM (input projection as a matmul, then one workgroup per
+  direction runs the recurrence with W_hh transposed so its reads coalesce), AdaIN/AdaLayerNorm, the F0/energy
+  blocks, the decoder and the generator. Convolutions with stride 1 use `conv1dRegSrc(8)`: 16 input channels staged once per
+  workgroup and reused for every tap, accumulators in vec4 registers (about 500 GFLOP/s on an iPhone against 70 for
+  the plain tiled `conv1d`, which keeps the strided ones). Both do dilation, offsets into channel concats and a fused
+  residual add; the generator's upsampling is `convT1d`.
+- **In JS**, between stages: durations (round half to even) and the frame index, the harmonic source and its STFT
+  (n_fft 20, hop 5), and the inverse STFT. Three small reads: duration logits, the F0 curve, the final spectrum.
+- **Submits**: the encoder and prosody are one each; every residual block of the decoder and generator is its own
+  submit, so a long sentence stays under WebKit's ~3 s per command buffer.
+- **Checked** by `bench/kokoro-check.html`: random weights at the real shapes against `src/ref/kokoro.js` (a plain
+  port of llama.cpp's graph), and `?real` loads the GGUFs, speaks and times each stage.
+- **Long replies**: one call takes at most 510 phonemes. `chunkSentences` (src/speech.js) groups sentences into
+  calls, the first one sentence for a fast first sound and each later one up to 3× the one before (synthesis runs
+  ~4× faster than playback on an iPhone 16 Pro, so each is ready before the one before ends), so the voice carries
+  its intonation across sentences. `trimSilence` cuts the ~0.3 s and ~0.5 s of silence Kokoro pads each clip with,
+  keeping 30 ms and 250 ms. `ClipPlayer` plays the clips on three `<audio>` elements (Web Audio stayed silent on an
+  iPhone): one plays, one loads the next clip, one finishes the clip before. Switching elements takes ~110 ms on an
+  iPhone, so each clip starts 120 ms early, inside the one before's trailing silence. A 17-sentence reply (9 calls)
+  starts in 0.7 s and plays with no gaps.
+- Not yet: turning text into phonemes (the G2P; the GGUF's "tts" template ports misaki), and splitting a single
+  sentence longer than 510 phonemes.
 
 ## Testing
 
