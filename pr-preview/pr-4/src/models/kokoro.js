@@ -15,6 +15,7 @@ import * as Kn from '../kernels.js';
 
 export const KOKORO = { HIDDEN: 512, STYLE: 128, BINS: 11, RATE: 24000, UPS: 300, N_FFT: 20, HOP: 5, N_HARM: 9, MAX_PHONEMES: 510 };
 
+const CONV_REG = Kn.conv1dRegSrc(8);
 const ew = (n) => [Math.min(Math.ceil(n / 256), 65535), Math.ceil(n / 256 / 65535)];
 const SRC = {};
 const mmSrc = (mt) => (SRC[mt] ||= Kn.matmulF32(mt));
@@ -292,7 +293,10 @@ export class Kokoro {
     const W = this.w[name + '.weight'], [K, IC, OC] = W.dims;
     const L = Math.floor((T + 2 * p - d * (K - 1) - 1) / s) + 1;
     const hasB = this.has(name + '.bias'), B = hasB ? this.w[name + '.bias'].buf : this.zero;
-    this.gpu.dispatch(enc, Kn.conv1d, [u([OC, IC, K, T, L, s, p, d, xOff, yOff, hasB ? 1 : 0, 0, alpha, beta, slope, 0], [12, 13, 14]), W.buf, X, B, Y], [Math.ceil(L / 64), Math.ceil(OC / 64)]);
+    const uni = u([OC, IC, K, T, L, s, p, d, xOff, yOff, hasB ? 1 : 0, 0, alpha, beta, slope, 0], [12, 13, 14]);
+    // Stride 1 (nearly every conv) takes the register-tiled kernel, ~7× faster on an iPhone; its window holds 64 extra steps.
+    if (s === 1 && (K - 1) * d <= 64) this.gpu.dispatch(enc, CONV_REG, [uni, W.buf, X, B, Y], [Math.ceil(L / 128), Math.ceil(OC / 64)]);
+    else this.gpu.dispatch(enc, Kn.conv1d, [uni, W.buf, X, B, Y], [Math.ceil(L / 64), Math.ceil(OC / 64)]);
     return { L, C: OC };
   }
 
