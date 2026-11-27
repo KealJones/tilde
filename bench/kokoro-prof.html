@@ -1,0 +1,79 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilde Kokoro kernel timings</title>
+<style>
+  body { font: 15px system-ui, sans-serif; margin: 16px; }
+  #bar { height: 10px; background: #ddd; border-radius: 5px; overflow: hidden; margin: 8px 0; }
+  #bar > div { height: 100%; width: 0; background: #3a7; transition: width .2s; }
+  pre { white-space: pre-wrap; font-size: 12px; }
+</style>
+<div id="step">Starting…</div>
+<div id="bar"><div></div></div>
+<pre id="log"></pre>
+<script type="module">
+// Times the generator's kernels at the sizes of a ~5 s sentence (stage 1: 256 × 4000, stage 2: 128 × 24000),
+// and checks conv1dWin against conv1d.
+import { openGpu } from '../src/gpu.js';
+import * as Kn from '../src/kernels.js';
+
+const log = (s) => { document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const mark = (s, f) => { document.getElementById('step').textContent = s; document.querySelector('#bar > div').style.width = `${Math.round(f * 100)}%`; window.__progress = { step: s, f }; };
+const u = (vals, fl = []) => { const a = new Uint32Array(vals.length), f = new Float32Array(a.buffer); vals.forEach((v, i) => (fl.includes(i) ? (f[i] = v) : (a[i] = v))); return a; };
+
+const sm = new URLSearchParams(location.search).has('small') ? 40 : 1; // ?small: SwiftShader-sized
+const gpu = await openGpu();
+const reg4 = Kn.conv1dRegSrc(4), reg8 = Kn.conv1dRegSrc(8);
+let seed = 1;
+const rnd = (n, sc = 1) => { const a = new Float32Array(n); for (let i = 0; i < n; i++) { seed = (seed * 1103515245 + 12345) >>> 0; a[i] = (seed / 2147483648 - 1) * sc; } return a; };
+const buf = (data) => { const b = gpu.buffer(data.length * 4, 'prof'); gpu.device.queue.writeBuffer(b, 0, data); return b; };
+const time = async (label, reps, rec, flop) => {
+  await gpu.run(rec); // warm (pipeline compile)
+  let best = Infinity;
+  for (let r = 0; r < reps; r++) best = Math.min(best, await gpu.run(rec));
+  log(`${label}: ${best.toFixed(1)} ms` + (flop ? `, ${(flop / best / 1e6).toFixed(0)} GFLOP/s` : ''));
+  return best;
+};
+
+const rows = [];
+try {
+  const convs = [[128, 24000, 11, 5], [128, 24000, 11, 1], [128, 24000, 7, 3], [128, 24000, 3, 1], [256, 4000, 11, 5], [256, 4000, 3, 1]];
+  for (let ci = 0; ci < convs.length; ci++) {
+    const [C, T0, K, d] = convs[ci], T = Math.ceil(T0 / sm) + 7; // +7: an edge tile
+    mark(`conv ${C}×${T} k${K} d${d}`, ci / (convs.length + 3));
+    const W = buf(rnd(C * C * K, 1 / Math.sqrt(C * K))), X = buf(rnd(C * T)), B = buf(rnd(C, 0.1));
+    const Y1 = gpu.buffer(C * T * 4, 'prof'), Y2 = gpu.buffer(C * T * 4, 'prof');
+    const pad = (K * d - d) / 2, uni = u([C, C, K, T, T, 1, pad, d, 0, 0, 1, 0, 1, 0, 1, 0], [12, 13, 14]);
+    const g = [Math.ceil(T / 64), Math.ceil(C / 64)], flop = 2 * C * C * K * T;
+    const a = await time(`conv1d    ${C}×${T} k${K} d${d}`, 3, (enc) => gpu.dispatch(enc, Kn.conv1d, [uni, W, X, B, Y1], g), flop);
+    const b = await time(`conv1dWin ${C}×${T} k${K} d${d}`, 3, (enc) => gpu.dispatch(enc, Kn.conv1dWin, [uni, W, X, B, Y2], g), flop);
+    const y1 = new Float32Array(await gpu.read(Y1));
+    const cmp = async (Y, label) => {
+      const y2 = new Float32Array(await gpu.read(Y));
+      let md = 0, mx = 0; for (let i = 0; i < y1.length; i++) { md = Math.max(md, Math.abs(y1[i] - y2[i])); mx = Math.max(mx, Math.abs(y1[i])); }
+      log(`  ${label} same output: max diff ${md.toExponential(2)} of ${mx.toFixed(2)}`);
+      return md / mx;
+    };
+    const dWin = await cmp(Y2, 'win');
+    const r4 = await time(`conv reg4  ${C}×${T} k${K} d${d}`, 3, (enc) => gpu.dispatch(enc, reg4, [uni, W, X, B, Y2], [Math.ceil(T / 64), Math.ceil(C / 64)]), flop);
+    const d4 = await cmp(Y2, 'reg4');
+    const r8 = await time(`conv reg8  ${C}×${T} k${K} d${d}`, 3, (enc) => gpu.dispatch(enc, reg8, [uni, W, X, B, Y2], [Math.ceil(T / 128), Math.ceil(C / 64)]), flop);
+    const d8 = await cmp(Y2, 'reg8');
+    rows.push({ C, T, K, d, old: a, win: b, reg4: r4, reg8: r8, diff: Math.max(dWin, d4, d8) });
+    [W, X, B, Y1, Y2].forEach((x) => gpu.free(x));
+  }
+  mark('adain, convT, axpby', 0.8);
+  const C = 128, T = 24000 / sm, X = buf(rnd(C * T)), G = buf(rnd(2 * C, 0.1)), A = buf(rnd(C, 0.5).map((v) => Math.abs(v) + 0.5)), Y = gpu.buffer(C * T * 4, 'prof');
+  rows.push({ adain: await time('adain snake 128×24000', 3, (enc) => gpu.dispatch(enc, Kn.adain, [u([C, T, 2, 1, 1e-5, 0, 0, 0], [3, 4]), X, G, A, Y], [C])) });
+  rows.push({ axpby: await time('axpby 128×24000', 3, (enc) => gpu.dispatch(enc, Kn.axpby, [u([C * T, 0, 0, 1, 1, 0, 0, 0], [3, 4]), X, Y], [Math.min(Math.ceil(C * T / 256), 65535), Math.ceil(C * T / 256 / 65535)])) });
+  const IC = 256, Ti = 4000 / sm, Wt = buf(rnd(IC * C * 12, 0.05)), Xi = buf(rnd(IC * Ti)), Bt = buf(rnd(C, 0.1)), Lo = Ti * 6 + 1, Yt = gpu.buffer(C * Lo * 4, 'prof');
+  rows.push({ convT: await time('convT1d 256→128 ×6 (4000→24001)', 3, (enc) => gpu.dispatch(enc, Kn.convT1d, [u([IC, C, 12, Ti, 6, 3, Lo, 1, 0.1, 0, 0, 0], [8]), Wt, Xi, Bt, Yt], [Math.ceil(Lo / 64), C]), 2 * IC * C * 2 * Lo) });
+  window.__rows = rows;
+  mark('Done', 1);
+  window.__result = { ok: rows.filter((r) => r.diff !== undefined).every((r) => r.diff < 1e-4) };
+} catch (e) {
+  log('error ' + (e.stack || e.message));
+  mark('Error: ' + e.message, 1);
+  window.__result = { ok: false, error: e.message };
+}
+</script>

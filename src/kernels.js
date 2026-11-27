@@ -1177,3 +1177,453 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
   let slot = (p.pos0 + t) % p.slots;
   for (var i = lid.x; i < p.W; i += 64u) { C[slot * p.W + i] = X[t * p.W + i]; }
 }`;
+
+// ---- Kokoro (src/models/kokoro.js). Activations are channel-major [C][T] unless a kernel says otherwise. ----
+
+/**
+ * 1D convolution as a 64×64-tiled implicit GEMM: Y[o, t] = alpha · (Σ_{c,k} W[o, c, k] · act(X[c, t·s + k·d − pad]) + b[o]
+ * + beta · Y[o, t]). W is [OC][IC·K] (torch layout), act is leaky ReLU with `slope` (1: none), out-of-range X is 0.
+ * X and Y start at word offsets xOff / yOff, so a conv can read or write one block of a channel concat.
+ */
+export const conv1d = /* wgsl */ `
+struct P { OC: u32, IC: u32, K: u32, T: u32, L: u32, s: u32, pad: u32, d: u32,
+  xOff: u32, yOff: u32, bias: u32, p0: u32, alpha: f32, beta: f32, slope: f32, p1: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read> X: array<f32>;
+@group(0) @binding(3) var<storage, read> B: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+var<workgroup> As: array<f32, 1024>;
+var<workgroup> Bs: array<f32, 1024>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let tx = lid.x; let ty = lid.y; let tid = ty * 16u + tx;
+  let n0 = wid.x * 64u; let m0 = wid.y * 64u;
+  let KK = p.IC * p.K;
+  var acc: array<f32, 16>;
+  for (var kb = 0u; kb < KK; kb += 16u) {
+    for (var r = 0u; r < 4u; r++) {
+      let e = tid + r * 256u;
+      let m = e / 16u; let ka = e % 16u;
+      var a = 0.0;
+      if (m0 + m < p.OC && kb + ka < KK) { a = W[(m0 + m) * KK + kb + ka]; }
+      As[ka * 64u + m] = a;
+      let n = e % 64u; let kk = e / 64u;
+      var b = 0.0;
+      if (n0 + n < p.L && kb + kk < KK) {
+        let c = (kb + kk) / p.K; let k = (kb + kk) % p.K;
+        let ti = i32((n0 + n) * p.s + k * p.d) - i32(p.pad);
+        if (ti >= 0 && ti < i32(p.T)) { b = X[p.xOff + c * p.T + u32(ti)]; b = select(b * p.slope, b, b > 0.0); }
+      }
+      Bs[kk * 64u + n] = b;
+    }
+    workgroupBarrier();
+    for (var kk = 0u; kk < 16u; kk++) {
+      var av: array<f32, 4>; var bv: array<f32, 4>;
+      for (var i = 0u; i < 4u; i++) { av[i] = As[kk * 64u + ty + 16u * i]; bv[i] = Bs[kk * 64u + tx + 16u * i]; }
+      for (var i = 0u; i < 4u; i++) { for (var j = 0u; j < 4u; j++) { acc[i * 4u + j] += av[i] * bv[j]; } }
+    }
+    workgroupBarrier();
+  }
+  for (var i = 0u; i < 4u; i++) {
+    let m = m0 + ty + 16u * i;
+    if (m >= p.OC) { continue; }
+    for (var j = 0u; j < 4u; j++) {
+      let n = n0 + tx + 16u * j;
+      if (n >= p.L) { continue; }
+      var v = acc[i * 4u + j];
+      if (p.bias == 1u) { v += B[m]; }
+      let o = p.yOff + m * p.L + n;
+      if (p.beta != 0.0) { v += p.beta * Y[o]; }
+      Y[o] = p.alpha * v;
+    }
+  }
+}`;
+
+/**
+ * Transposed conv (kernel 2·s, stride s), cropped by `trim` on both sides: Y[o, q] for q < L·s, plus bias, input
+ * through leaky ReLU (`slope`). W is [IC][OC][K]. shift 1 reflect-pads one step on the left (Y has L·s + 1 steps).
+ */
+export const convT1d = /* wgsl */ `
+struct P { IC: u32, OC: u32, K: u32, T: u32, s: u32, trim: u32, Lo: u32, shift: u32, slope: f32, p0: u32, p1: u32, p2: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read> X: array<f32>;
+@group(0) @binding(3) var<storage, read> B: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let q = gid.x; let o = gid.y;
+  if (q >= p.Lo) { return; }
+  var qi = q;
+  if (p.shift == 1u) { qi = select(q - 1u, 1u, q == 0u); }
+  let tt = qi + p.trim;
+  var acc = B[o];
+  for (var k = tt % p.s; k < p.K; k += p.s) {
+    if (k > tt) { break; }
+    let i = (tt - k) / p.s;
+    if (i >= p.T) { continue; }
+    for (var c = 0u; c < p.IC; c++) {
+      var x = X[c * p.T + i];
+      x = select(x * p.slope, x, x > 0.0);
+      acc += W[(c * p.OC + o) * p.K + k] * x;
+    }
+  }
+  Y[o * p.Lo + q] = acc;
+}`;
+
+/**
+ * AdaIN: per channel (one workgroup each), Y = act(norm_t(X) · (1 + G[c]) + G[C + c]), norm over T with eps.
+ * mode 0: none, 1: leaky ReLU (slope), 2: snake x + sin²(a·x)/a with a = A[c]. In place is fine.
+ */
+export const adain = /* wgsl */ `
+struct P { C: u32, T: u32, mode: u32, slope: f32, eps: f32, p0: u32, p1: u32, p2: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> X: array<f32>;
+@group(0) @binding(2) var<storage, read> G: array<f32>;
+@group(0) @binding(3) var<storage, read> A: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+var<workgroup> red: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let c = wid.x; let base = c * p.T;
+  var s = 0.0;
+  for (var t = lid.x; t < p.T; t += 256u) { s += X[base + t]; }
+  red[lid.x] = s; workgroupBarrier();
+  for (var k = 128u; k > 0u; k >>= 1u) { if (lid.x < k) { red[lid.x] += red[lid.x + k]; } workgroupBarrier(); }
+  let mean = red[0] / f32(p.T); workgroupBarrier();
+  var v = 0.0;
+  for (var t = lid.x; t < p.T; t += 256u) { let e = X[base + t] - mean; v += e * e; }
+  red[lid.x] = v; workgroupBarrier();
+  for (var k = 128u; k > 0u; k >>= 1u) { if (lid.x < k) { red[lid.x] += red[lid.x + k]; } workgroupBarrier(); }
+  let inv = inverseSqrt(red[0] / f32(p.T) + p.eps);
+  let g = 1.0 + G[c]; let b = G[p.C + c];
+  for (var t = lid.x; t < p.T; t += 256u) {
+    var y = (X[base + t] - mean) * inv * g + b;
+    if (p.mode == 1u) { y = select(y * p.slope, y, y > 0.0); }
+    if (p.mode == 2u) { let a = A[c]; let sn = sin(a * y); y = y + sn * sn / a; }
+    Y[base + t] = y;
+  }
+}`;
+
+/** Y[yOff + i] = a · Y[yOff + i] + b · X[xOff + i] (a = 0: scaled copy). */
+export const axpby = /* wgsl */ `
+struct P { n: u32, xOff: u32, yOff: u32, a: f32, b: f32, p0: u32, p1: u32, p2: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> X: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Y: array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.y * 65535u * 256u + gid.x;
+  if (i >= p.n) { return; }
+  let o = p.yOff + i;
+  var v = p.b * X[p.xOff + i];
+  if (p.a != 0.0) { v += p.a * Y[o]; }
+  Y[o] = v;
+}`;
+
+/**
+ * Upsampling step of a Kokoro AdainResBlk1d on [C][T] → [C][2T]. mode 0: depthwise ConvTranspose1d (kernel 3,
+ * stride 2, padding 1, output padding 1; W [3][C], tap k at k·C) plus bias. mode 1: nearest (each step twice).
+ */
+export const up2 = /* wgsl */ `
+struct P { C: u32, T: u32, mode: u32, p0: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> X: array<f32>;
+@group(0) @binding(2) var<storage, read> W: array<f32>;
+@group(0) @binding(3) var<storage, read> B: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let q = gid.x; let c = gid.y;
+  if (q >= 2u * p.T) { return; }
+  let i = q >> 1u; let x = X[c * p.T + i];
+  var y = x;
+  if (p.mode == 0u) {
+    if ((q & 1u) == 0u) { y = W[p.C + c] * x; }
+    else { var nx = 0.0; if (i + 1u < p.T) { nx = X[c * p.T + i + 1u]; } y = W[2u * p.C + c] * x + W[c] * nx; }
+    y += B[c];
+  }
+  Y[c * 2u * p.T + q] = y;
+}`;
+
+/** Y[c · rows + r] = X[r · cols + c] (rows × cols → cols × rows). */
+export const transpose = /* wgsl */ `
+struct P { rows: u32, cols: u32, p0: u32, p1: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> X: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Y: array<f32>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let c = gid.x; let r = gid.y;
+  if (c < p.cols && r < p.rows) { Y[c * p.rows + r] = X[r * p.cols + c]; }
+}`;
+
+/** LayerNorm over the channels of [C][n] for each step (gamma, beta, eps 1e-5), then leaky ReLU 0.2, in place. */
+export const lnChanLeaky = /* wgsl */ `
+struct P { C: u32, n: u32, p0: u32, p1: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> X: array<f32>;
+@group(0) @binding(2) var<storage, read> g: array<f32>;
+@group(0) @binding(3) var<storage, read> b: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let t = gid.x;
+  if (t >= p.n) { return; }
+  var m = 0.0;
+  for (var c = 0u; c < p.C; c++) { m += X[c * p.n + t]; }
+  m /= f32(p.C);
+  var v = 0.0;
+  for (var c = 0u; c < p.C; c++) { let e = X[c * p.n + t] - m; v += e * e; }
+  let inv = inverseSqrt(v / f32(p.C) + 1e-5);
+  for (var c = 0u; c < p.C; c++) {
+    let y = (X[c * p.n + t] - m) * inv * g[c] + b[c];
+    X[c * p.n + t] = select(0.2 * y, y, y > 0.0);
+  }
+}`;
+
+/**
+ * Rows of the prosody input [n][N + S]: mode 0 writes X[t, :N] = Y[t, :] and X[t, N:] = style. mode 1 is
+ * AdaLayerNorm: X[t, :N] = (1 + G[j]) · LN(Y[t])[j] + G[N + j] (eps 1e-5); the style columns stay. One workgroup per row.
+ */
+export const prosodyRows = /* wgsl */ `
+struct P { N: u32, S: u32, mode: u32, p0: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> Y: array<f32>;
+@group(0) @binding(2) var<storage, read> G: array<f32>;
+@group(0) @binding(3) var<storage, read_write> X: array<f32>;
+var<workgroup> red: array<f32, 128>;
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = wid.x; let src = t * p.N; let dst = t * (p.N + p.S);
+  if (p.mode == 0u) {
+    for (var j = lid.x; j < p.N; j += 128u) { X[dst + j] = Y[src + j]; }
+    for (var j = lid.x; j < p.S; j += 128u) { X[dst + p.N + j] = G[j]; }
+    return;
+  }
+  var s = 0.0;
+  for (var j = lid.x; j < p.N; j += 128u) { s += Y[src + j]; }
+  red[lid.x] = s; workgroupBarrier();
+  for (var k = 64u; k > 0u; k >>= 1u) { if (lid.x < k) { red[lid.x] += red[lid.x + k]; } workgroupBarrier(); }
+  let mean = red[0] / f32(p.N); workgroupBarrier();
+  var v = 0.0;
+  for (var j = lid.x; j < p.N; j += 128u) { let e = Y[src + j] - mean; v += e * e; }
+  red[lid.x] = v; workgroupBarrier();
+  for (var k = 64u; k > 0u; k >>= 1u) { if (lid.x < k) { red[lid.x] += red[lid.x + k]; } workgroupBarrier(); }
+  let inv = inverseSqrt(red[0] / f32(p.N) + 1e-5);
+  for (var j = lid.x; j < p.N; j += 128u) { X[dst + j] = (1.0 + G[j]) * (Y[src + j] - mean) * inv + G[p.N + j]; }
+}`;
+
+/**
+ * Bidirectional LSTM recurrence (torch gates i f g o, hidden 256): workgroup 0 runs forward, 1 backward.
+ * G0/G1 hold the input projections plus biases [n][1024]; U0/U1 are W_hh transposed, [256][1024]. Y is [n][512].
+ */
+export const lstm = /* wgsl */ `
+struct P { n: u32, p0: u32, p1: u32, p2: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> G0: array<f32>;
+@group(0) @binding(2) var<storage, read> G1: array<f32>;
+@group(0) @binding(3) var<storage, read> U0: array<f32>;
+@group(0) @binding(4) var<storage, read> U1: array<f32>;
+@group(0) @binding(5) var<storage, read_write> Y: array<f32>;
+var<workgroup> h: array<f32, 256>;
+fn sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-clamp(x, -30.0, 30.0))); }
+// tanh without the inf/inf of a fast-math exp form
+fn th(x: f32) -> f32 { let u = clamp(x, -15.0, 15.0); return 1.0 - 2.0 / (exp(2.0 * u) + 1.0); }
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let dir = wid.x; let j = lid.x;
+  h[j] = 0.0;
+  var c = 0.0;
+  workgroupBarrier();
+  for (var s = 0u; s < p.n; s++) {
+    let t = select(s, p.n - 1u - s, dir == 1u);
+    var a = vec4<f32>(0.0);
+    if (dir == 0u) {
+      a = vec4<f32>(G0[t * 1024u + j], G0[t * 1024u + 256u + j], G0[t * 1024u + 512u + j], G0[t * 1024u + 768u + j]);
+      for (var i = 0u; i < 256u; i++) {
+        let hv = h[i]; let r = i * 1024u + j;
+        a += hv * vec4<f32>(U0[r], U0[r + 256u], U0[r + 512u], U0[r + 768u]);
+      }
+    } else {
+      a = vec4<f32>(G1[t * 1024u + j], G1[t * 1024u + 256u + j], G1[t * 1024u + 512u + j], G1[t * 1024u + 768u + j]);
+      for (var i = 0u; i < 256u; i++) {
+        let hv = h[i]; let r = i * 1024u + j;
+        a += hv * vec4<f32>(U1[r], U1[r + 256u], U1[r + 512u], U1[r + 768u]);
+      }
+    }
+    c = sig(a.y) * c + sig(a.x) * th(a.z);
+    let hn = sig(a.w) * th(c);
+    workgroupBarrier();
+    h[j] = hn;
+    workgroupBarrier();
+    Y[t * 512u + dir * 256u + j] = hn;
+  }
+}`;
+
+/** ALBERT input: Y[t, i] = Tok[I[t], i] + Pos[t, i] for i < e (the token table rows are E wide, zero-padded). */
+export const embedAdd = /* wgsl */ `
+struct P { E: u32, e: u32, n: u32, p0: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> Tok: array<f32>;
+@group(0) @binding(2) var<storage, read> Pos: array<f32>;
+@group(0) @binding(3) var<storage, read> I: array<u32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let k = gid.x;
+  if (k >= p.n * p.e) { return; }
+  let t = k / p.e; let i = k % p.e;
+  Y[k] = Tok[I[t] * p.E + i] + Pos[t * p.e + i];
+}`;
+
+/** In place: X = gelu(X) with the tanh approximation (ggml_gelu). */
+export const geluTanh = /* wgsl */ `
+struct P { n: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> X: array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.y * 65535u * 256u + gid.x;
+  if (i >= p.n) { return; }
+  let x = X[i];
+  // tanh(u) = 1 - 2 / (exp(2u) + 1), clamped so exp stays finite
+  let u = clamp(0.7978845608028654 * (x + 0.044715 * x * x * x), -15.0, 15.0);
+  X[i] = 0.5 * x * (2.0 - 2.0 / (exp(2.0 * u) + 1.0));
+}`;
+
+/**
+ * conv1d for stride 1 (same uniforms and bindings): each workgroup stages a window of 16 input channels once and
+ * reuses it for every tap, so X is read about once instead of K times and the inner loop has no div/mod.
+ * Window 64 + (K-1)·d must fit in 192 (K 11, d 5 is 114).
+ */
+export const conv1dWin = /* wgsl */ `
+struct P { OC: u32, IC: u32, K: u32, T: u32, L: u32, s: u32, pad: u32, d: u32,
+  xOff: u32, yOff: u32, bias: u32, p0: u32, alpha: f32, beta: f32, slope: f32, p1: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read> X: array<f32>;
+@group(0) @binding(3) var<storage, read> B: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+var<workgroup> As: array<f32, 1024>;
+var<workgroup> Xs: array<f32, 3072>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let tx = lid.x; let ty = lid.y; let tid = ty * 16u + tx;
+  let n0 = wid.x * 64u; let m0 = wid.y * 64u;
+  let win = 64u + (p.K - 1u) * p.d;
+  let KK = p.IC * p.K;
+  var acc: array<f32, 16>;
+  for (var cb = 0u; cb < p.IC; cb += 16u) {
+    for (var e = tid; e < 16u * win; e += 256u) {
+      let c = e / win; let x = e - c * win;
+      let ti = i32(n0 + x) - i32(p.pad);
+      var b = 0.0;
+      if (cb + c < p.IC && ti >= 0 && ti < i32(p.T)) { b = X[p.xOff + (cb + c) * p.T + u32(ti)]; b = select(b * p.slope, b, b > 0.0); }
+      Xs[c * 192u + x] = b;
+    }
+    for (var k = 0u; k < p.K; k++) {
+      for (var r = 0u; r < 4u; r++) {
+        let e = tid + r * 256u;
+        let m = e >> 4u; let c = e & 15u;
+        var a = 0.0;
+        if (m0 + m < p.OC && cb + c < p.IC) { a = W[(m0 + m) * KK + (cb + c) * p.K + k]; }
+        As[c * 64u + m] = a;
+      }
+      workgroupBarrier();
+      let sh = k * p.d;
+      for (var c = 0u; c < 16u; c++) {
+        var av: array<f32, 4>; var bv: array<f32, 4>;
+        for (var i = 0u; i < 4u; i++) { av[i] = As[c * 64u + ty + 16u * i]; bv[i] = Xs[c * 192u + tx + 16u * i + sh]; }
+        for (var i = 0u; i < 4u; i++) { for (var j = 0u; j < 4u; j++) { acc[i * 4u + j] += av[i] * bv[j]; } }
+      }
+      workgroupBarrier();
+    }
+  }
+  for (var i = 0u; i < 4u; i++) {
+    let m = m0 + ty + 16u * i;
+    if (m >= p.OC) { continue; }
+    for (var j = 0u; j < 4u; j++) {
+      let n = n0 + tx + 16u * j;
+      if (n >= p.L) { continue; }
+      var v = acc[i * 4u + j];
+      if (p.bias == 1u) { v += B[m]; }
+      let o = p.yOff + m * p.L + n;
+      if (p.beta != 0.0) { v += p.beta * Y[o]; }
+      Y[o] = p.alpha * v;
+    }
+  }
+}`;
+
+/**
+ * Stride-1 conv1d like conv1dWin, with the accumulators in vec4 registers (no dynamically indexed arrays, which
+ * WebKit's Metal backend can leave in memory). Each thread owns 4 output channels × `cols` (4 or 8) contiguous
+ * steps, so a workgroup covers 64 channels × 16·cols steps. Dispatch [ceil(L / (16·cols)), ceil(OC / 64)].
+ */
+export const conv1dRegSrc = (cols) => {
+  const nv = cols / 4, tile = 16 * cols;
+  const accs = [...Array(4 * nv)].map((_, i) => `var a${i} = vec4<f32>(0.0);`).join(' ');
+  const bvs = [...Array(nv)].map((_, v) => `let b${v} = vec4<f32>(Xs[xb + ${4 * v}u], Xs[xb + ${4 * v + 1}u], Xs[xb + ${4 * v + 2}u], Xs[xb + ${4 * v + 3}u]);`).join('\n        ');
+  const fmas = [...Array(4)].map((_, i) => [...Array(nv)].map((_, v) => `a${i * nv + v} += av.${'xyzw'[i]} * b${v};`).join(' ')).join('\n        ');
+  const outs = [...Array(4)].map((_, i) => [...Array(nv)].map((_, v) => `out(m0 + ty * 4u + ${i}u, n0 + tx * ${cols}u + ${4 * v}u, a${i * nv + v});`).join(' ')).join('\n  ');
+  return /* wgsl */ `
+struct P { OC: u32, IC: u32, K: u32, T: u32, L: u32, s: u32, pad: u32, d: u32,
+  xOff: u32, yOff: u32, bias: u32, p0: u32, alpha: f32, beta: f32, slope: f32, p1: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<storage, read> X: array<f32>;
+@group(0) @binding(3) var<storage, read> B: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Y: array<f32>;
+const XW = ${tile + 64}u;
+var<workgroup> As: array<f32, 1024>;
+var<workgroup> Xs: array<f32, ${16 * (tile + 64)}>;
+fn out(m: u32, n: u32, v: vec4<f32>) {
+  if (m >= p.OC) { return; }
+  var b = 0.0;
+  if (p.bias == 1u) { b = B[m]; }
+  for (var j = 0u; j < 4u; j++) {
+    if (n + j >= p.L) { return; }
+    let o = p.yOff + m * p.L + n + j;
+    var y = v[j] + b;
+    if (p.beta != 0.0) { y += p.beta * Y[o]; }
+    Y[o] = p.alpha * y;
+  }
+}
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let tx = lid.x; let ty = lid.y; let tid = ty * 16u + tx;
+  let n0 = wid.x * ${tile}u; let m0 = wid.y * 64u;
+  let win = ${tile}u + (p.K - 1u) * p.d;
+  let KK = p.IC * p.K;
+  ${accs}
+  for (var cb = 0u; cb < p.IC; cb += 16u) {
+    for (var e = tid; e < 16u * win; e += 256u) {
+      let c = e / win; let x = e - c * win;
+      let ti = i32(n0 + x) - i32(p.pad);
+      var b = 0.0;
+      if (cb + c < p.IC && ti >= 0 && ti < i32(p.T)) { b = X[p.xOff + (cb + c) * p.T + u32(ti)]; b = select(b * p.slope, b, b > 0.0); }
+      Xs[c * XW + x] = b;
+    }
+    for (var k = 0u; k < p.K; k++) {
+      for (var r = 0u; r < 4u; r++) {
+        let e = tid + r * 256u;
+        let m = e >> 4u; let c = e & 15u;
+        var a = 0.0;
+        if (m0 + m < p.OC && cb + c < p.IC) { a = W[(m0 + m) * KK + (cb + c) * p.K + k]; }
+        As[c * 64u + m] = a;
+      }
+      workgroupBarrier();
+      let sh = k * p.d;
+      for (var c = 0u; c < 16u; c++) {
+        let ab = c * 64u + ty * 4u;
+        let av = vec4<f32>(As[ab], As[ab + 1u], As[ab + 2u], As[ab + 3u]);
+        let xb = c * XW + tx * ${cols}u + sh;
+        ${bvs}
+        ${fmas}
+      }
+      workgroupBarrier();
+    }
+  }
+  ${outs}
+}`;
+};

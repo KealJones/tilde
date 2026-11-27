@@ -1,6 +1,6 @@
 # Tilde: notes for agents
 
-WebGPU engine for small language models that must survive iPhone Safari (~1.9 GB per tab shared by JS, Wasm and
+WebGPU engine for small AI models (text, pictures, video, audio, speech) that must survive iPhone Safari (~1.9 GB per tab shared by JS, Wasm and
 GPU; ~3 s per GPU command buffer). Read docs/design.md first; it is the contract.
 
 ## Rules
