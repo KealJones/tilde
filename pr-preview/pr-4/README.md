@@ -137,7 +137,8 @@ HTTPS).
 
 - [Kokoro-82M](https://huggingface.co/ggml-org/Kokoro-82M-GGUF) (hexgrad): text to speech, 54 voices, from its two
   official GGUFs (`loadKokoro(backboneUrl, mmprojUrl)`, then `speak(phonemes, { voice })`). Input is phonemes
-  (misaki's output); the G2P is not ported yet.
+  (misaki's output); the G2P is not ported yet. For long replies, `chunkSentences` groups sentences per call,
+  `trimSilence` cuts each clip's padding and `ClipPlayer` plays the clips back to back with no gaps on an iPhone.
 
 Model code lives in one file per architecture (`src/models/`), picked from the GGUF's `general.architecture` and
 imported only when a model of that kind loads, so adding another costs pages that don't use it nothing.

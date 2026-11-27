@@ -84,3 +84,99 @@ export function wav(pcm, rate = SPEECH_RATE) {
   for (let i = 0; i < pcm.length; i++) b.setInt16(44 + i * 2, Math.max(-32768, Math.min(32767, Math.round(pcm[i] * 32767))), true);
   return new Uint8Array(b.buffer);
 }
+
+/**
+ * Cuts the silence a TTS clip is padded with, keeping `before` s ahead of the speech and `after` s behind it (a
+ * natural pause, with room for a word that fades out quietly). Kokoro pads each clip with ~0.3 s and ~0.5 s.
+ * shortcut: the threshold is a fixed fraction of the clip's peak; revisit if quiet voices lose their first sound.
+ * @param {Float32Array} pcm
+ */
+export function trimSilence(pcm, { rate = SPEECH_RATE, before = 0.03, after = 0.25, floor = 0.01 } = {}) {
+  const thr = floor * pcm.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+  let a = 0, b = pcm.length - 1;
+  while (a < b && Math.abs(pcm[a]) < thr) a++;
+  while (b > a && Math.abs(pcm[b]) < thr) b--;
+  return pcm.subarray(Math.max(0, a - Math.round(before * rate)), Math.min(pcm.length, b + 1 + Math.round(after * rate)));
+}
+
+/**
+ * Groups sentences into chunks to speak one per call, so the voice carries its intonation across sentences and
+ * there are fewer hand-offs. The first chunk is one sentence (fast first sound); each later one may be up to
+ * `grow`× the one before it (synthesis runs ~4× faster than playback on an iPhone, so it's ready before that one
+ * ends), and at most `max` long. A sentence longer than the cap still goes alone.
+ * @param {string[]} sentences
+ */
+export function chunkSentences(sentences, { max = 250, grow = 3 } = {}) {
+  const out = [];
+  let prev = 0;
+  for (const s of sentences) {
+    const last = out.at(-1);
+    if (last && out.length > 1 && last.length + 1 + s.length <= Math.min(max, grow * prev)) out[out.length - 1] = last + ' ' + s;
+    else { if (last) prev = last.length; out.push(s); }
+  }
+  return out;
+}
+
+/**
+ * Plays clips back to back as they arrive, without gaps or cut endings. It uses <audio> elements, not Web
+ * Audio, which stayed silent on an iPhone. There are three: one plays, the next clip loads into another, and the
+ * third finishes the clip before. Switching elements takes ~110 ms on an iPhone, so each clip starts `lead` s
+ * before the one before it ends, inside that clip's trailing silence (keep `after` in trimSilence longer).
+ * Call `unlock()` inside a tap first.
+ */
+export class ClipPlayer {
+  constructor({ rate = SPEECH_RATE, lead = 0.12 } = {}) {
+    Object.assign(this, { rate, lead, queue: [], cur: -1, playing: false, started: 0, dur: 0, timer: 0 });
+    /** ms each clip started past the end of the one before (negative = early, inside its trailing silence) */
+    this.handoffs = [];
+    this.els = Array.from({ length: 3 }, () => Object.assign(new Audio(), { preload: 'auto' }));
+    for (const e of this.els) e.onended = () => { if (e === this.els[this.cur]) this.#next(); else if (!this.playing) this.#idle(); };
+  }
+
+  /** Starts every element on a moment of silence; iOS only lets an element play after one play() in a tap. */
+  unlock() {
+    const u = URL.createObjectURL(new Blob([wav(new Float32Array(240), this.rate)], { type: 'audio/wav' }));
+    for (const e of this.els) { e.src = u; e.play().catch(() => {}); }
+  }
+
+  /** @param {Float32Array} pcm */
+  push(pcm) {
+    this.queue.push({ u: URL.createObjectURL(new Blob([wav(pcm, this.rate)], { type: 'audio/wav' })), dur: pcm.length / this.rate });
+    if (!this.playing) this.#next();
+    else if (this.queue.length === 1) this.#preload();
+  }
+
+  /** Resolves once everything pushed so far has played. */
+  done() { return this.playing ? new Promise((r) => (this.onIdle = r)) : Promise.resolve(); }
+
+  stop() {
+    clearTimeout(this.timer);
+    this.queue.length = 0;
+    for (const e of this.els) e.pause();
+    this.playing = false;
+    this.#idle();
+  }
+
+  #idle() { const r = this.onIdle; this.onIdle = null; r?.(); }
+
+  #preload() { if (this.queue[0]) { const e = this.els[(this.cur + 1) % 3]; e.src = this.queue[0].u; e.load(); } }
+
+  #next() {
+    clearTimeout(this.timer);
+    const q = this.queue.shift();
+    this.playing = !!q;
+    if (!q) { this.started = 0; return this.#idle(); }
+    this.cur = (this.cur + 1) % 3;
+    const e = this.els[this.cur];
+    if (e.src !== q.u) e.src = q.u;
+    e.onplaying = () => {
+      e.onplaying = null;
+      const now = performance.now();
+      if (this.started) this.handoffs.push(now - this.started - this.dur * 1000);
+      this.started = now; this.dur = q.dur;
+      this.timer = setTimeout(() => { if (this.queue[0]) this.#next(); }, Math.max(0, (q.dur - this.lead) * 1000));
+    };
+    e.play().catch(() => {});
+    this.#preload();
+  }
+}
