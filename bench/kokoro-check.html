@@ -16,6 +16,8 @@
 // Kokoro on the GPU against the CPU reference (src/ref/kokoro.js).
 //   kokoro-check.html            random weights at the real shapes, a few tokens (SwiftShader-sized)
 //   kokoro-check.html?real       the ggml-org GGUFs: load, speak ?text= (phonemes) with ?voice=, time each stage
+//   kokoro-check.html?long       the GGUFs: speak a long reply sentence by sentence (fixtures/kokoro-long.json), and the
+//                                silence a listener would hear between sentences if each played as soon as it was made
 import { openGpu } from '../src/gpu.js';
 import { httpSource } from '../src/gguf.js';
 import { Kokoro, gaussian } from '../src/models/kokoro.js';
@@ -85,14 +87,52 @@ async function randomCheck(gpu) {
   return ok;
 }
 
-async function realCheck(gpu) {
+async function loadReal(gpu, frac) {
   const base = qs.get('base') || 'https://huggingface.co/ggml-org/Kokoro-82M-GGUF/resolve/main/';
   const t0 = performance.now();
   mark('Loading Kokoro (270 MB)', 0);
   const k = await Kokoro.load(gpu, httpSource(base + 'Kokoro-82M-F32.gguf'), httpSource(base + 'mmproj-Kokoro-82M-F16.gguf'), {
-    onProgress: ({ loaded, total }) => mark(`Loading Kokoro: ${Math.round(loaded / 1048576)} of ${Math.round(total / 1048576)} MB`, 0.8 * loaded / total),
+    onProgress: ({ loaded, total }) => mark(`Loading Kokoro: ${Math.round(loaded / 1048576)} of ${Math.round(total / 1048576)} MB`, frac * loaded / total),
   });
   log(`load ${Math.round(performance.now() - t0)} ms, ${k.voices.length} voices, GPU`, JSON.stringify(gpu.report()));
+  return k;
+}
+
+function playButton(pcm) {
+  const btn = document.getElementById('play');
+  btn.hidden = false;
+  btn.onclick = () => { const ac = new AudioContext(); const b = ac.createBuffer(1, pcm.length, 24000); b.copyToChannel(pcm, 0); const s = ac.createBufferSource(); s.buffer = b; s.connect(ac.destination); s.start(); };
+}
+
+async function longCheck(gpu) {
+  const sents = await (await fetch('fixtures/kokoro-long.json')).json();
+  const k = await loadReal(gpu, 0.3);
+  const voice = qs.get('voice') || k.defaultVoice;
+  // Play each sentence as soon as it's made, after the one before ends: the silence before sentence i is
+  // how far its synthesis ran past the end of sentence i - 1.
+  const pcms = [], gaps = [], t0 = performance.now();
+  let playEnd = 0, first = 0;
+  for (let i = 0; i < sents.length; i++) {
+    mark(`Speaking sentence ${i + 1} of ${sents.length}`, 0.3 + 0.7 * i / sents.length);
+    const t1 = performance.now();
+    const pcm = await k.speak(sents[i], { voice });
+    const ready = (performance.now() - t0) / 1000, dur = pcm.length / 24000;
+    if (i === 0) first = playEnd = ready; else gaps.push(Math.max(0, ready - playEnd));
+    playEnd = Math.max(playEnd, ready) + dur;
+    pcms.push(pcm);
+    log(`${i + 1}: ${sents[i].length} phonemes, ${Math.round(performance.now() - t1)} ms for ${dur.toFixed(2)} s` + (i ? `, silence before it ${gaps[i - 1].toFixed(2)} s` : ''), JSON.stringify(k.times));
+  }
+  const all = new Float32Array(pcms.reduce((a, p) => a + p.length, 0));
+  pcms.reduce((o, p) => (all.set(p, o), o + p.length), 0);
+  const total = gaps.reduce((a, b) => a + b, 0);
+  log(`first sentence after ${first.toFixed(2)} s; silence between sentences: total ${total.toFixed(2)} s, worst ${Math.max(...gaps).toFixed(2)} s, ${gaps.filter((g) => g > 0.05).length} of ${gaps.length} gaps over 50 ms`);
+  playButton(all);
+  window.__stats = { first, gaps, total, audio: all.length / 24000 };
+  return !all.some(Number.isNaN);
+}
+
+async function realCheck(gpu) {
+  const k = await loadReal(gpu, 0.8);
   const text = qs.get('text') || 'həlˈoʊ, ðɪs ɪz tˈɪldə spˈiːkɪŋ ˈɔn ðə ʤˈiːpˌiːjˈuː.';
   const voice = qs.get('voice') || k.defaultVoice;
   const runs = [];
@@ -109,16 +149,14 @@ async function realCheck(gpu) {
   let peak = 0, rms = 0, nan = 0;
   for (const v of pcm) { if (Number.isNaN(v)) nan++; else { peak = Math.max(peak, Math.abs(v)); rms += v * v; } }
   log(`peak ${peak.toFixed(3)}, rms ${Math.sqrt(rms / pcm.length).toFixed(4)}, NaN ${nan}`);
-  const btn = document.getElementById('play');
-  btn.hidden = false;
-  btn.onclick = () => { const ac = new AudioContext(); const b = ac.createBuffer(1, pcm.length, 24000); b.copyToChannel(pcm, 0); const s = ac.createBufferSource(); s.buffer = b; s.connect(ac.destination); s.start(); };
+  playButton(pcm);
   window.__stats = { runs, seconds: pcm.length / 24000, peak, nan, times: k.times, report: gpu.report() };
   return nan === 0 && peak > 0.01 && peak < 10;
 }
 
 try {
   const gpu = await openGpu();
-  const ok = qs.has('real') ? await realCheck(gpu) : await randomCheck(gpu);
+  const ok = qs.has('long') ? await longCheck(gpu) : qs.has('real') ? await realCheck(gpu) : await randomCheck(gpu);
   mark(ok ? 'Done: all good' : 'Done: something failed', 1);
   log(ok ? 'PASS' : 'FAIL');
   window.__result = { ok };
