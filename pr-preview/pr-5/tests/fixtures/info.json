@@ -1,0 +1,22 @@
+{
+ "tensors": 287,
+ "last": {
+  "name": "blk.23.shortconv.out_proj.weight",
+  "offset": 1047256384,
+  "nbytes": 2359296
+ },
+ "fixtures": {
+  "blk.0.ffn_gate.weight": {
+   "type": "Q4_0",
+   "rows": 2,
+   "cols": 2048,
+   "bytes": 2304
+  },
+  "token_embd.weight": {
+   "type": "Q6_K",
+   "rows": 2,
+   "cols": 2048,
+   "bytes": 3360
+  }
+ }
+}

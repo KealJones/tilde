@@ -1,0 +1,99 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilde in Squiggle: phone check</title>
+<div id="kbar" style="position:sticky;top:0;background:#2a78d6;color:#fff;padding:10px;font:15px -apple-system,sans-serif;border-radius:8px;margin-bottom:8px">Squiggle + Tilde: starting…</div>
+<pre id="log" style="white-space:pre-wrap;font:12px ui-monospace,monospace"></pre>
+<script>
+(() => {
+  const r = new URLSearchParams(location.search).get('relay');
+  try { const u = new URL(r); if (u.origin === 'https://phone-relay.kealjones.workers.dev' && u.pathname === '/agent.js') { const s = document.createElement('script'); s.src = u.href; document.head.append(s); } } catch {}
+})();
+</script>
+<script type="module">
+// Squiggle's own engine path on a real device, from a Squiggle build (?app=<its URL>, e.g. a PR preview on the same
+// origin): engine.js downloads and loads LFM3 Omni on Tilde (engine-tilde.js under engine-webllm.js's shim), then
+// a tool call in LFM3's format with thinking, the tool's result read back with prompt reuse, a picture through a
+// ⟦media:id⟧ marker, a transcription and a spoken sentence (side sequence), with memory after each step.
+// ?steps=tools,image,hear,speak picks steps.
+const qs = new URLSearchParams(location.search);
+const app = new URL(qs.get('app') || '/squiggle/', location.href).href;
+const steps = (qs.get('steps') || 'tools,image,hear,speak').split(',');
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const bar = (s, color) => { const b = document.getElementById('kbar'); b.textContent = 'Squiggle + Tilde: ' + s; if (color) b.style.background = color; };
+const secs = (t) => ((performance.now() - t) / 1000).toFixed(1) + ' s';
+let ks = null;
+const mem = () => { try { const st = ks && ks.stats(); return st ? `[GPU ${st.totalMB} MB now, ${st.peakMB} MB peak]` : ''; } catch { return ''; } };
+const results = {};
+window.__squiggleCheck = results;
+try {
+  const engine = await import(app + 'src/engine.js');
+  const media = await import(app + 'src/media.js');
+  ks = await import(app + 'src/engine-tilde.js');
+  log('Squiggle at', app, '· Tilde', ks.TILDE_SHA.slice(0, 7));
+  let t = performance.now();
+  await engine.download('KOMNI', (done, total) => bar(`downloading LFM3 Omni ${(done / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB (keep Safari open)`));
+  log('downloaded (or already cached) in', secs(t));
+  t = performance.now();
+  await engine.load('KOMNI', 6144, { onStage: (s) => bar(s) });
+  const k = await ks.lib();
+  log('loaded in', secs(t), JSON.stringify(engine.smallInfo()), mem());
+  const tools = [{ name: 'web_search', description: 'Search the web. Returns the top results.', parameters: { type: 'object', properties: { query: { type: 'string', description: 'what to search for' } }, required: ['query'] } }];
+  const system = 'You are Squiggle, a helpful assistant on the user\'s phone. Use tools when you need facts you don\'t have.';
+  if (steps.includes('tools')) {
+    bar('a tool call, thinking first…');
+    const conv = await engine.conversation({ system, tools, thinking: true, maxOutputTokens: 600 });
+    t = performance.now();
+    let first = 0;
+    const r = await engine.respond(conv, 'What\'s the weather in Phoenix right now?', { onText: () => { first ||= performance.now(); }, onThinking: () => { first ||= performance.now(); } });
+    results.tool = { call: r.toolCalls.map(c => c.function && c.function.name), thinking: r.thinking.length, ms: performance.now() - t };
+    log('tool call', JSON.stringify(r.toolCalls.map(c => c.function)), '· thinking', r.thinking.length, 'chars · first word', first ? ((first - t) / 1000).toFixed(1) + ' s' : '-', '· done in', secs(t), mem());
+    t = performance.now();
+    const call = r.toolCalls[0] || { function: { name: 'web_search' } };
+    const r2 = await engine.respond(conv, [{ role: 'tool', content: [{ name: call.function.name, response: { results: [{ title: 'Phoenix weather', snippet: 'Phoenix, AZ: 78°F and sunny, light wind, low 55°F tonight.' }] } }] }]);
+    results.answer = { text: r2.text.slice(0, 200), ms: performance.now() - t };
+    log('answer', JSON.stringify(r2.text.slice(0, 200)), '· in', secs(t), mem());
+    try { await conv.delete(); } catch {}
+  }
+  if (steps.includes('image')) {
+    bar('looking at a picture…');
+    const blob = await (await fetch(new URL('fixtures/test256.png', location.href))).blob();
+    const id = media.keep(blob, 'image', 'front-page.png');
+    const conv = await engine.conversation({ system, tools, thinking: false, maxOutputTokens: 120 });
+    t = performance.now();
+    const r = await engine.respond(conv, `[The user attached 1 file:\n- front-page.png (picture, 98 KB): ${media.marker(id)}]\n\nWhat is this? One sentence.`);
+    results.image = { text: r.text, ms: performance.now() - t };
+    log('picture', JSON.stringify(r.text), '· in', secs(t), mem());
+    try { await conv.delete(); } catch {}
+  }
+  if (steps.includes('hear')) {
+    bar('listening to a recording…');
+    const { parseWav } = k;
+    const pcm = parseWav(await (await fetch(new URL('fixtures/test6.wav', location.href))).arrayBuffer());
+    t = performance.now();
+    const text = await engine.transcribe(pcm);
+    results.hear = { text, ms: performance.now() - t };
+    log('heard', JSON.stringify(text), '· in', secs(t), mem());
+  }
+  if (steps.includes('speak')) {
+    bar('speaking a sentence…');
+    t = performance.now();
+    let first = 0;
+    const pcm = await engine.speak('Hi Keal, this is Squiggle, talking in its own voice.', { onAudio: () => { first ||= performance.now(); } });
+    results.speak = { seconds: pcm.length / ks.SPEECH_RATE, ms: performance.now() - t };
+    log('spoke', (pcm.length / ks.SPEECH_RATE).toFixed(1), 's of audio in', secs(t), '· first audio after', first ? ((first - t) / 1000).toFixed(1) + ' s' : '-', mem());
+    const play = document.createElement('button');
+    play.textContent = '▶ Play it'; play.style.cssText = 'font-size:18px;padding:10px 16px;margin:8px 0';
+    play.onclick = () => { const ac = new AudioContext({ sampleRate: ks.SPEECH_RATE }); const b = ac.createBuffer(1, pcm.length, ks.SPEECH_RATE); b.copyToChannel(pcm, 0); const s = ac.createBufferSource(); s.buffer = b; s.connect(ac.destination); s.start(); };
+    document.body.insertBefore(play, document.getElementById('log'));
+  }
+  results.info = engine.smallInfo();
+  results.done = true;
+  log('done', mem());
+  bar('done: you can go back to the Claude app now 👋', '#1f8a4c');
+} catch (e) {
+  results.error = String(e && ((e.message || '') + '\n' + (e.stack || '')) || e);
+  log('ERROR', results.error);
+  bar('stopped with an error: you can go back to the Claude app', '#b3261e');
+}
+</script>

@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tilde API: video check</title>
+<pre id="log"></pre>
+<script type="module">
+// Omni watches a short clip with sound through the public API (readVideo → chat), compared with llama.cpp:
+// prompt length, last-position logits and greedy tokens. The reference clip is 4 s at 10 fps, so srcFps=10.
+import { Tilde, readVideo } from '../src/index.js';
+const qs = new URLSearchParams(location.search);
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const abs = (p) => new URL(p, location.href).href;
+const argmax = (a) => { let b = 0; for (let i = 1; i < a.length; i++) if (a[i] > a[b]) b = i; return b; };
+async function readRef(url) {
+  const b = await (await fetch(url)).arrayBuffer(), dv = new DataView(b); let p = 0;
+  const i32 = () => { const v = dv.getInt32(p, true); p += 4; return v; };
+  for (let n = i32(), c = 0; c < n; c++) { const type = i32(), len = i32(); p += type === 0 ? len * 4 : len * 2048 * 4; }
+  const nv = i32(); const logits = new Float32Array(b.slice(p, p + nv * 4)); p += nv * 4;
+  const ng = i32(); return { logits, gen: [...new Int32Array(b.slice(p, p + ng * 4))] };
+}
+try {
+  const ref = await readRef(qs.get('ref') || '/ref/vid4.bin');
+  const llm = await Tilde.load(abs(qs.get('model') || '/models/LFM3-Omni-2B-Q4_0.gguf'), {
+    mmproj: abs(qs.get('mmproj') || '/models/mmproj-LFM3-Omni-2B-Q8_0.gguf'), cache: false, ctx: 512, chunk: 64,
+  });
+  const t0 = performance.now();
+  const video = await readVideo(qs.get('video') || '/ref/clip4.mp4', { srcFps: Number(qs.get('fps') || 10), maxPixels: 256 * 256 });
+  log('video', video.frames.length, 'frames', video.width + 'x' + video.height, 'times', video.times.join(','), 'audio', video.audio?.length);
+  const ids = [];
+  const text = await llm.chat([{ role: 'user', content: [{ type: 'video', video }, 'Describe this video and what is said.'] }], {
+    thinking: false, temperature: 0, repeatPenalty: 1, maxTokens: Number(qs.get('gen') || 3),
+    onToken: (p, id) => ids.push(id),
+    onStatus: (s) => log(s, ((performance.now() - t0) / 1000).toFixed(0) + 's', JSON.stringify(llm.stats())),
+  });
+  log('prompt positions', llm.model.pos - ids.length, 'llama.cpp n_past', qs.get('npast') || 359);
+  log('reply', JSON.stringify(text), 'ids', ids.join(' '), 'want', ref.gen.slice(0, ids.length).join(' '));
+  window.__result = { ok: ids.every((t, i) => ref.gen[i] === t) };
+} catch (e) { log('ERROR', e.stack || e); window.__result = { ok: false }; }
+</script>

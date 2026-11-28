@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tilde API: image chat check</title>
+<pre id="log"></pre>
+<script type="module">
+// Omni through the public API: chat() with an image part, greedy, compared with llama.cpp's first tokens.
+import { Tilde } from '../src/index.js';
+const qs = new URLSearchParams(location.search);
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const abs = (p) => new URL(p, location.href).href;
+try {
+  const llm = await Tilde.load(abs(qs.get('model') || '/models/LFM3-Omni-2B-Q4_0.gguf'), {
+    mmproj: abs(qs.get('mmproj') || '/models/mmproj-LFM3-Omni-2B-Q8_0.gguf'), cache: false, ctx: 256, chunk: 64,
+  });
+  log('loaded', JSON.stringify(llm.stats()));
+  const bmp = await createImageBitmap(await (await fetch(qs.get('image') || '/ref/test256.png')).blob());
+  const c = new OffscreenCanvas(bmp.width, bmp.height); const cx = c.getContext('2d'); cx.drawImage(bmp, 0, 0);
+  const image = cx.getImageData(0, 0, bmp.width, bmp.height);
+  const ids = [];
+  const t0 = performance.now();
+  const text = await llm.chat([{ role: 'user', content: [{ type: 'image', image }, 'What is in this image? Answer in one sentence.'] }], {
+    thinking: false, temperature: 0, repeatPenalty: 1, maxTokens: Number(qs.get('gen') || 3),
+    onToken: (p, id) => ids.push(id), onStatus: (s) => log(s, ((performance.now() - t0) / 1000).toFixed(0) + 's', JSON.stringify(llm.stats())),
+  });
+  const want = (qs.get('want') || '597,4145,3926').split(',').map(Number);
+  log('reply', JSON.stringify(text), 'ids', ids.join(' '), 'want', want.join(' '));
+  window.__result = { ok: want.every((t, i) => ids[i] === t) };
+} catch (e) { log('ERROR', e.stack || e); window.__result = { ok: false }; }
+</script>

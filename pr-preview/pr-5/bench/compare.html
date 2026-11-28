@@ -1,0 +1,823 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tilde vs the other browser runtimes</title>
+<style>
+  :root { --ok: #1f8a4c; --bad: #c0392b; --warn: #b7791f; --mute: #6b7280; --line: #e5e7eb; --bg: #fff; --fg: #111; }
+  @media (prefers-color-scheme: dark) { :root { --line: #333; --bg: #111; --fg: #eee; --mute: #9ca3af; } }
+  body { font: 15px -apple-system, system-ui, sans-serif; margin: 0 auto; max-width: 1100px; padding: 0 12px 40px; background: var(--bg); color: var(--fg); }
+  h1 { font-size: 20px; margin: 14px 0 4px; }
+  h2 { font-size: 16px; margin: 22px 0 6px; }
+  p { margin: 6px 0; }
+  .mute { color: var(--mute); font-size: 13px; }
+  #bar { position: sticky; top: 0; z-index: 2; background: #2a78d6; color: #fff; padding: 10px 12px; border-radius: 8px; margin: 8px 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  #bar span { flex: 1; min-width: 200px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+  #bar button { border-color: #fff8; background: #fff2; color: #fff; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 8px 0; }
+  label { display: inline-block; margin: 3px 10px 3px 0; }
+  input[type=text] { font: inherit; width: 140px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border-bottom: 1px solid var(--line); padding: 5px 6px; text-align: left; vertical-align: top; }
+  th { font-weight: 600; white-space: nowrap; }
+  td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .scroll { overflow-x: auto; }
+  .ok { color: var(--ok); font-weight: 600; } .bad { color: var(--bad); font-weight: 600; } .warn { color: var(--warn); font-weight: 600; }
+  .bars { display: grid; grid-template-columns: minmax(150px, 220px) 1fr; gap: 4px 8px; align-items: center; font-size: 13px; }
+  .track { background: var(--line); border-radius: 4px; height: 18px; position: relative; }
+  .fill { background: #2a78d6; height: 100%; border-radius: 4px; }
+  .fill.tilde { background: #1f8a4c; }
+  .track b { position: absolute; left: 6px; top: 1px; font-weight: 600; font-size: 12px; }
+  pre { white-space: pre-wrap; font: 12px ui-monospace, monospace; }
+  details { margin: 8px 0; }
+</style>
+
+<h1>~ Tilde vs the other browser runtimes</h1>
+<p class="mute">One 4-bit model (LFM3 1.7B or Qwen3 0.6B) on every runtime that has a build of it. Each test runs alone in a fresh page
+load and writes every step to this browser's storage as it goes, so a tab iOS kills still leaves its result: the next
+load records how far it got and moves on to the next test. Results never leave this phone unless you export or share them.</p>
+
+<div id="bar"><span id="status">starting…</span><button id="awake" hidden>Tap to keep the screen on</button><button id="stop" hidden>Stop</button><button id="resume" hidden>Resume</button></div>
+
+<fieldset id="setup">
+  <legend>New run</legend>
+  <label>Model <select id="model"></select></label>
+  <div id="engines"></div>
+  <label>Prompt sizes <input type="text" id="prompts" value="256,1024,3072"></label>
+  <label>Tokens to write <input type="text" id="gen" value="64" style="width:60px"></label>
+  <label>Context <input type="text" id="ctx" value="4096" style="width:60px"></label>
+  <label>Rest between tests (s) <input type="text" id="pause" value="5" style="width:50px"></label>
+  <p><button id="start">Start a run</button> <button id="wipe">Delete downloaded models</button></p>
+  <p class="mute">The first pass downloads each runtime's own copy of the model (LFM3: about 5.6 GB in all, Qwen3 0.6B:
+  about 2 GB; keep the phone on Wi-Fi,
+  awake and on this tab). Tests take turns by prompt size, so the phone warms up evenly for everyone. A runtime that dies
+  or times out on a prompt isn't asked to try a longer one.</p>
+</fieldset>
+
+<h2>Results</h2>
+<div id="pick"></div>
+<div id="facts" class="mute"></div>
+<div id="summary"></div>
+<div class="scroll"><table id="table"></table></div>
+<p><button id="md">Copy as Markdown</button> <button id="share">Share</button> <button id="json">Save JSON</button></p>
+<details><summary>What each column means</summary>
+<p class="mute"><b>Load</b>: from asking the runtime to load to ready, with the model already downloaded. <b>Read</b>: prompt
+tokens per second while reading the prompt. <b>Write</b>: tokens per second while writing, after the first. <b>First token</b>:
+from sending the prompt to the first written token. <b>GPU</b>: peak WebGPU buffer memory made on this page and not yet
+destroyed, counted the same way for every runtime by watching <code>createBuffer</code>; wllama runs in a worker, so its
+memory isn't visible here. <b>Worst frame</b>: the longest the page went without drawing while writing (a stalled screen).
+Every runtime gets the same text, greedy decoding, no repeat penalty, and one short warm-up request first. LiteRT-LM only
+takes chat messages, so its prompt also gets the chat template's few tokens.</p></details>
+<h2>Log</h2>
+<pre id="log"></pre>
+
+<script>
+// The phone relay's agent (KealJones/phone-relay), only when asked for with ?relay=.
+(() => {
+  const r = new URLSearchParams(location.search).get('relay');
+  try { const u = new URL(r); if (u.origin === 'https://phone-relay.kealjones.workers.dev' && u.pathname === '/agent.js') { const s = document.createElement('script'); s.src = u.href; document.head.append(s); } } catch {}
+})();
+</script>
+<script type="module">
+// URL options (all optional): ?run=1 starts a run with these settings if none is going
+//   &engines=tilde,webllm,…  &prompts=256,1024,3072  &gen=64  &ctx=4096  &pause=5
+//   &sha=<commit>  pins Tilde through jsDelivr instead of ../src/
+//   &model=lfm3|qwen3-0.6b   which model every runtime runs (default lfm3)
+//   &onnx=<repo>   another transformers.js repo than the model's default
+//   &compat=0|1    force wllama's normal or Safari (compat) build; default: whichever this browser can compile
+//   &dry=1         adds a fake engine for checking the page itself
+const qs = new URLSearchParams(location.search);
+const $ = (id) => document.getElementById(id);
+const HF = 'https://huggingface.co/';
+const TILDE = qs.get('sha') ? `https://cdn.jsdelivr.net/gh/KealJones/tilde@${qs.get('sha')}/src/` : '../src/';
+const V = { webllm: '0.2.87', wllama: '3.13.0', transformers: '4.4.0-next.0', litert: '0.19.0' };
+// Each model, as each runtime gets it. GGUF (Tilde and wllama), MLC (WebLLM), ONNX (transformers.js), LiteRT-LM.
+const MODELS = {
+  lfm3: {
+    name: 'LFM3 1.7B',
+    gguf: HF + 'LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-QAD-Q4_0.gguf', ggufBytes: 1049615680,
+    mlc: {
+      f16: { id: 'LFM3-1.7B-QAD-q4f16_1-MLC', model: HF + 'kealjones/LFM3-1.7B-QAD-q4f16_1-MLC/resolve/main/',
+        model_lib: HF + 'kealjones/LFM3-1.7B-QAD-q4f16_1-MLC/resolve/main/LFM3-1.7B-q4f16_1-b1-webgpu.wasm' },
+      f32: { id: 'LFM3-1.7B-QAD-q4f32_1-MLC', model: HF + 'kealjones/LFM3-1.7B-QAD-q4f32_1-MLC/resolve/main/',
+        model_lib: HF + 'kealjones/LFM3-1.7B-QAD-q4f32_1-MLC/resolve/main/LFM3-1.7B-q4f32_1-b1-webgpu.wasm' },
+    },
+    onnx: 'onnx-community/LFM3-1.7B-ONNX',
+    litert: (ctx) => `hf://litert-community/LFM3-1.7B-LiteRT@main/LFM3-1.7B_mixed_int4_ekv${ctx <= 2048 ? 2048 : 4096}.litertlm`,
+  },
+  'qwen3-0.6b': {
+    name: 'Qwen3 0.6B',
+    // llama.cpp's own Q4_0: every weight Q4_0, embedding and head included (unsloth's mixes in Q4_1).
+    gguf: HF + 'ggml-org/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_0.gguf', ggufBytes: 428970080,
+    // WebLLM's own prebuilt builds.
+    mlc: { f16: { id: 'Qwen3-0.6B-q4f16_1-MLC', prebuilt: true }, f32: { id: 'Qwen3-0.6B-q4f32_1-MLC', prebuilt: true } },
+    onnx: 'onnx-community/Qwen3-0.6B-ONNX',
+    litert: () => 'hf://litert-community/Qwen3-0.6B@main/Qwen3-0.6B_dynamic_wi4b32_afp32.litertlm',
+  },
+};
+// "Tilde, big chunks": more prompt tokens per GPU pass and a longer submit budget (?bigChunk=…&bigBudget=… in ms).
+const BIG = { chunk: Number(qs.get('bigChunk')) || 256, submitBudgetMs: Number(qs.get('bigBudget')) || 2000 };
+const ENGINES = [
+  { id: 'tilde', name: 'Tilde', what: 'the 4-bit GGUF, read directly' },
+  { id: 'tilde-big', name: 'Tilde, big chunks', what: `the same, reading prompts ${BIG.chunk} tokens per pass with a ${BIG.submitBudgetMs / 1000} s submit budget (default 64 and 1 s)` },
+  { id: 'webllm', name: `WebLLM ${V.webllm}`, what: 'a 4-bit MLC build, stock WebLLM' },
+  { id: 'webllm-paced', name: 'WebLLM + Squiggle\'s pacing', what: 'the same, prompt read in 128-token pieces with a wait after each (what Squiggle ships)' },
+  { id: 'wllama-gpu', name: `wllama ${V.wllama} WebGPU`, what: 'llama.cpp, same GGUF, all layers on the GPU' },
+  { id: 'wllama-cpu', name: `wllama ${V.wllama} CPU`, what: 'llama.cpp in WebAssembly, same GGUF' },
+  { id: 'transformers', name: `transformers.js ${V.transformers}`, what: 'ONNX on WebGPU, q4f16' },
+  { id: 'litert', name: `LiteRT-LM ${V.litert}`, what: 'Google\'s runtime on WebGPU, litert-community 4-bit' },
+];
+if (qs.get('dry')) ENGINES.push({ id: 'dry', name: 'Dry run', what: 'fake engine: ?die=<prompt> kills its tab, ?fail=<prompt> throws' });
+const ENGINE = Object.fromEntries(ENGINES.map((e) => [e.id, e]));
+
+// ── storage ─────────────────────────────────────────────────────────────────────────────────────────────────
+const KEY = 'tilde-compare';
+let db;
+try { db = JSON.parse(localStorage.getItem(KEY)) || { suites: [] }; } catch { db = { suites: [] }; }
+const save = () => {
+  for (;;) {
+    try { localStorage.setItem(KEY, JSON.stringify(db)); return; } catch (e) {
+      if (db.suites.length > 1) db.suites.shift(); else { console.warn('results not saved', e); return; }
+    }
+  }
+};
+const current = () => db.suites.at(-1);
+// The model of the run in progress, else the one asked for in the URL or the form.
+const M = () => { const s = current(); return MODELS[(s && !s.ended && s.settings.model) || qs.get('model') || $('model')?.value || 'lfm3'] || MODELS.lfm3; };
+const GGUF_ = () => M().gguf;
+const ONNX_ = () => qs.get('onnx') || M().onnx;
+let viewing = null; // suite id picked in the results list
+
+// ── what this browser is ────────────────────────────────────────────────────────────────────────────────────
+// wllama checks Memory64 by making a memory, which passes on iOS 27.2 even though its wasm then can't compile.
+// Validating a tiny module with a 64-bit memory asks the compiler itself.
+const memory64Compiles = () => { try { return WebAssembly.validate(new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 5, 3, 1, 4, 1])); } catch { return false; } };
+async function gatherFacts() {
+  const ua = navigator.userAgent;
+  const f = {
+    ua, device: /iPhone|iPad|Android/.exec(ua)?.[0] || (/Mac OS X/.test(ua) ? 'Mac' : 'computer'),
+    os: (/OS (\d+[_.\d]*) like Mac/.exec(ua)?.[1] || /Android [\d.]+/.exec(ua)?.[0] || '').replace(/_/g, '.'),
+    safari: /Version\/([\d.]+)/.exec(ua)?.[1] || null,
+    cores: navigator.hardwareConcurrency || null, crossOriginIsolated: !!globalThis.crossOriginIsolated,
+    jspi: !!WebAssembly.Suspending, memory64: memory64Compiles(), webgpu: !!navigator.gpu,
+  };
+  if (navigator.gpu) {
+    try {
+      const a = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      if (a) {
+        const i = a.info || {};
+        f.adapter = [...new Set([i.vendor, i.architecture, i.device, i.description].filter(Boolean))].join(' ') || 'unnamed';
+        f.shaderF16 = a.features.has('shader-f16');
+        f.maxBufferMB = Math.round(a.limits.maxBufferSize / 1048576);
+      } else f.adapter = 'none';
+    } catch (e) { f.adapter = 'error: ' + e.message; }
+  }
+  try { const e = await navigator.storage.estimate(); f.storageFreeGB = +((e.quota - e.usage) / 1e9).toFixed(1); } catch {}
+  return f;
+}
+
+// ── watching the page: GPU buffers, lost devices, frames ───────────────────────────────────────────────────
+// Patched before any runtime loads, so every runtime that uses WebGPU on this page is counted the same way.
+const gpuMem = { live: 0, peak: 0, sizes: new WeakMap() };
+const watch = { lost: null, gpuError: null, errors: [] };
+if (globalThis.GPUDevice) {
+  const create = GPUDevice.prototype.createBuffer;
+  GPUDevice.prototype.createBuffer = function (d) {
+    const b = create.call(this, d);
+    gpuMem.sizes.set(b, d.size); gpuMem.live += d.size; if (gpuMem.live > gpuMem.peak) gpuMem.peak = gpuMem.live;
+    return b;
+  };
+  const destroy = GPUBuffer.prototype.destroy;
+  GPUBuffer.prototype.destroy = function () {
+    const s = gpuMem.sizes.get(this);
+    if (s) { gpuMem.live -= s; gpuMem.sizes.delete(this); }
+    return destroy.call(this);
+  };
+  const request = GPUAdapter.prototype.requestDevice;
+  GPUAdapter.prototype.requestDevice = async function (...args) {
+    const d = await request.apply(this, args);
+    d.lost.then((info) => { if (info.reason !== 'destroyed' || !unloading) watch.lost ||= { reason: info.reason, message: info.message || '', during: stageNow(), atS: secs() }; });
+    d.addEventListener?.('uncapturederror', (e) => { watch.gpuError ||= { message: String(e.error?.message || e.error).slice(0, 300), during: stageNow() }; });
+    return d;
+  };
+}
+addEventListener('error', (e) => watch.errors.length < 3 && watch.errors.push(String(e.message).slice(0, 300)));
+addEventListener('unhandledrejection', (e) => watch.errors.length < 3 && watch.errors.push(String(e.reason?.message || e.reason).slice(0, 300)));
+let unloading = false;
+let fakeKill = false; // the dry engine's stand-in for iOS killing the tab
+const frames = { last: performance.now(), phase: null, by: {} };
+(function tick(t) {
+  const gap = t - frames.last; frames.last = t;
+  if (frames.phase && !document.hidden) {
+    const p = frames.by[frames.phase] ||= { worst: 0, slow: 0 };
+    if (gap > p.worst) p.worst = gap;
+    if (gap > 100) p.slow++;
+  }
+  requestAnimationFrame(tick);
+})(performance.now());
+
+const MB = (n) => Math.round(n / 1048576);
+const t0page = performance.now();
+const secs = () => +((performance.now() - t0page) / 1000).toFixed(1);
+let stageNow = () => null;
+const log = (...a) => { const s = a.join(' '); $('log').textContent += s + '\n'; console.log(s); };
+const status = (s) => { $('status').textContent = s; };
+
+// ── the run queue ───────────────────────────────────────────────────────────────────────────────────────────
+const TEXT = 'The history of the ocean is the history of life on Earth. Tides, currents and storms shape coastlines, carry heat '
+  + 'from the equator toward the poles, and feed the plankton that sit at the base of almost every food web. Sailors once '
+  + 'read the sea by its colour and its swell; today satellites measure its height to the centimetre, floats drift through '
+  + 'its depths reporting temperature and salt, and ships still lower bottles on cables to sample water nobody has touched '
+  + 'in a thousand years. ';
+
+function settingsFromForm() {
+  const list = (s) => s.split(',').map((x) => Number(x.trim())).filter((x) => x > 0);
+  const engines = [...document.querySelectorAll('#engines input:checked')].map((i) => i.value);
+  return { model: $('model').value, engines, prompts: list($('prompts').value).sort((a, b) => a - b), gen: Number($('gen').value) || 64,
+    ctx: Number($('ctx').value) || 4096, pause: Number($('pause').value) || 0 };
+}
+function fillForm() {
+  $('engines').innerHTML = ENGINES.map((e) => `<label title="${e.what}"><input type="checkbox" value="${e.id}" ${e.id === 'dry' ? '' : 'checked'}> ${e.name}</label>`).join('');
+  if (qs.get('engines')) for (const i of document.querySelectorAll('#engines input')) i.checked = qs.get('engines').split(',').includes(i.value);
+  $('model').innerHTML = Object.entries(MODELS).map(([id, m]) => `<option value="${id}">${m.name}</option>`).join('');
+  for (const k of ['model', 'prompts', 'gen', 'ctx', 'pause']) if (qs.get(k)) $(k).value = qs.get(k);
+}
+
+async function startSuite(settings) {
+  if (!settings.engines.length || !settings.prompts.length) return status('pick at least one runtime and one prompt size');
+  if (settings.prompts.at(-1) + settings.gen > settings.ctx) return status(`the longest prompt plus ${settings.gen} tokens doesn't fit in a ${settings.ctx}-token context`);
+  status('reading the tokenizer to build the prompts…');
+  const facts = await gatherFacts();
+  // Every runtime gets the same text: exactly N tokens of it by the model's own tokenizer (read from its GGUF; only
+  // the header, a few MB), turned back into text. Each runtime reports how many tokens it actually read.
+  const kx = await import(TILDE + 'index.js');
+  const { readGGUF } = await import(TILDE + 'gguf.js');
+  const gguf = MODELS[settings.model].gguf;
+  const hdr = await readGGUF(await kx.cachedSource(kx.httpSource(gguf), { key: gguf }));
+  const tok = kx.Tokenizer.fromGGUF(hdr.kv);
+  let text = TEXT;
+  while (tok.encode(text).length < settings.prompts.at(-1)) text += TEXT;
+  const ids = tok.encode(text);
+  const prompts = Object.fromEntries(settings.prompts.map((n) => [n, tok.decode(ids.slice(0, n))]));
+  const queue = [];
+  for (const e of settings.engines) queue.push({ kind: 'prepare', engine: e, status: 'pending' });
+  for (const n of settings.prompts) for (const e of settings.engines) queue.push({ kind: 'run', engine: e, prompt: n, status: 'pending' });
+  queue.forEach((q, i) => { q.id = i; q.result = {}; q.attempts = 0; });
+  db.suites.push({ id: Date.now().toString(36), started: new Date().toISOString(), settings, facts, prompts, queue,
+    tilde: qs.get('sha') || 'this page\'s copy' });
+  while (db.suites.length > 12) db.suites.shift();
+  save();
+  // Drop ?run=1 so the reloads between tests don't start yet another run.
+  qs.delete('run');
+  history.replaceState(null, '', location.pathname + (qs.size ? '?' + qs : ''));
+  location.reload();
+}
+
+// A test still marked running when the page loads didn't finish: the tab was killed (or the page was left).
+function settle(s) {
+  const it = s.queue.find((q) => q.status === 'running');
+  if (!it) return;
+  // A test that died while the page was hidden (phone locked, app switched) says nothing about the runtime: iOS
+  // suspends and kills background tabs. Try it once more.
+  if ((it.leftAt || it.result.hidden) && it.attempts < 2) {
+    it.status = 'pending';
+    it.result = { notes: [...(it.result.notes || []), 'the page was hidden or left while it ran; tried again'] };
+  } else {
+    it.status = it.leftAt ? 'interrupted' : 'died';
+    it.result.diedDuring = it.stages?.at(-1)?.[0] || 'starting';
+    if (it.live?.gpuMB) it.result.gpuAtDeathMB = it.live.gpuMB;
+    if (it.live?.gpuPeakMB) it.result.gpuPeakMB = it.live.gpuPeakMB;
+    if (it.live?.lost) it.result.gpuLost = it.live.lost;
+    log(`${ENGINE[it.engine]?.name}: ${it.status} during "${it.result.diedDuring}"`);
+  }
+  skipAfter(s, it);
+  save();
+}
+// No point asking a runtime that died on a prompt to try a longer one, or one that couldn't download to run at all.
+function skipAfter(s, it) {
+  if (!['died', 'timeout', 'error', 'interrupted'].includes(it.status)) return;
+  for (const q of s.queue) {
+    if (q.status !== 'pending' || q.engine !== it.engine) continue;
+    if (it.kind === 'prepare') { q.status = 'skipped'; q.result.reason = `couldn't get the model ready (${it.status})`; }
+    else if (q.prompt > it.prompt) { q.status = 'skipped'; q.result.reason = `${it.status} at ${it.prompt} tokens`; }
+  }
+}
+
+let timer = null;
+function advance(s) {
+  if (s.stopped) { status('Stopped. Resume carries on where it left off.'); $('resume').hidden = false; $('stop').hidden = true; return; }
+  const next = s.queue.find((q) => q.status === 'pending');
+  if (!next) {
+    if (!s.ended) { s.ended = new Date().toISOString(); save(); }
+    status('Done. Results below.');
+    $('stop').hidden = true; $('resume').hidden = true;
+    window.__result = { ok: true, suite: s };
+    return;
+  }
+  $('stop').hidden = false; $('resume').hidden = true;
+  const left = s.queue.filter((q) => q.status === 'pending').length;
+  let wait = s.queue.some((q) => q.status !== 'pending') ? s.settings.pause : 1;
+  const tickDown = () => {
+    status(`Next: ${label(next)} in ${wait} s (${left} left)`);
+    if (wait-- <= 0) { timer = null; runItem(s, next); } else timer = setTimeout(tickDown, 1000);
+  };
+  tickDown();
+}
+const label = (q) => `${ENGINE[q.engine]?.name || q.engine}, ${q.kind === 'prepare' ? 'download' : q.prompt + '-token prompt'}`;
+
+// Longest a stage may take before the test counts as stuck.
+const LIMIT_S = { downloading: 45 * 60, 'downloading or loading': 45 * 60, loading: 10 * 60, 'warm-up': 5 * 60 };
+const runLimit = (q) => (q.engine === 'wllama-cpu' ? 25 * 60 : 10 * 60);
+
+async function runItem(s, it) {
+  it.status = 'running'; it.attempts++; it.startedAt = new Date().toISOString(); it.stages = []; it.leftAt = null;
+  const tStart = performance.now();
+  let stageT = tStart, stageName = 'starting';
+  const stage = (name) => {
+    stageName = name; stageT = performance.now();
+    it.stages.push([name, +((stageT - tStart) / 1000).toFixed(1)]);
+    frames.phase = name;
+    status(`${label(it)}: ${name}`);
+    console.log(`[compare] ${label(it)}: ${name} at ${it.stages.at(-1)[1]} s`);
+    save();
+  };
+  stageNow = () => stageName;
+  const live = () => { it.live = { gpuMB: MB(gpuMem.live), gpuPeakMB: MB(gpuMem.peak), lost: watch.lost, t: +((performance.now() - tStart) / 1000).toFixed(1) }; };
+  const beat = setInterval(() => {
+    live(); save();
+    const limit = /reading|writing/.test(stageName) ? runLimit(it) : (LIMIT_S[stageName] || 15 * 60);
+    if ((performance.now() - stageT) / 1000 > limit) {
+      it.status = 'timeout'; it.result.timeoutDuring = stageName; it.result.timeoutAfterS = limit;
+      skipAfter(s, it); save(); location.reload();
+    }
+  }, 1000);
+  addEventListener('pagehide', () => { if (it.status === 'running' && !fakeKill) { it.leftAt = new Date().toISOString(); save(); } });
+  document.addEventListener('visibilitychange', () => { if (document.hidden && it.status === 'running' && !fakeKill) { it.result.hidden = true; save(); } });
+  stage('starting');
+  const c = {
+    s, it, stage, gen: s.settings.gen, ctx: s.settings.ctx, facts: s.facts, text: s.prompts[it.prompt], n: it.prompt,
+    note: (o) => { Object.assign(it.result, o); save(); },
+    progress: (msg) => status(`${label(it)}: ${msg}`),
+  };
+  try {
+    const engine = RUNNERS[it.engine];
+    if (!engine) throw new Error('unknown runtime ' + it.engine);
+    // Right after a runtime crashes the GPU process, a browser can have no GPU to give for a while (Safari: ~11 s,
+    // Squiggle's REVIVE_WAITS). Wait for one, so a runtime isn't blamed for the one before it.
+    if (navigator.gpu && !['wllama-cpu', 'dry'].includes(it.engine)) {
+      stage('waiting for the GPU');
+      const t = now();
+      let a = null;
+      for (let i = 0; i < 30 && !(a = await navigator.gpu.requestAdapter().catch(() => null)); i++) await sleep(1000);
+      if (now() - t > 1500) c.note({ waitedForGpuS: S(now() - t) });
+      if (!a) throw new Error('no GPU adapter after 30 s (the test before this one may have crashed the GPU)');
+    }
+    if (it.kind === 'prepare') await engine.prepare(c);
+    else {
+      const r = await engine.run(c);
+      live();
+      Object.assign(it.result, r, {
+        gpuPeakMB: MB(gpuMem.peak) || null,
+        // The page's longest stall while the model read and wrote (worker runtimes like wllama included).
+        worstFrameMs: Math.round(Math.max(0, ...Object.entries(frames.by).filter(([k]) => /reading|writing/.test(k)).map(([, v]) => v.worst))) || null,
+        slowFrames: Object.entries(frames.by).filter(([k]) => /reading|writing/.test(k)).reduce((a, [, v]) => a + v.slow, 0),
+      });
+    }
+    it.status = watch.lost ? 'lost-gpu' : 'done';
+  } catch (e) {
+    it.status = watch.lost ? 'lost-gpu' : 'error';
+    it.result.error = String(e?.message || e).slice(0, 500);
+    it.result.errorDuring = stageName;
+    it.result.gpuPeakMB = MB(gpuMem.peak) || null;
+    log(label(it), 'ERROR', e?.stack || e);
+  }
+  clearInterval(beat);
+  if (watch.lost) it.result.gpuLost = watch.lost;
+  if (watch.gpuError) it.result.gpuError = watch.gpuError;
+  if (watch.errors.length) it.result.pageErrors = watch.errors;
+  it.result.totalS = +((performance.now() - tStart) / 1000).toFixed(1);
+  it.ended = new Date().toISOString();
+  if (it.status !== 'done' && it.result.hidden && it.attempts < 2) {
+    log(label(it), it.status, 'while the page was hidden; trying again', JSON.stringify(it.result));
+    it.status = 'pending';
+    it.result = { notes: ['failed while the page was hidden; tried again'] };
+  }
+  if (it.status === 'lost-gpu') skipAfter(s, { ...it, status: 'error' });
+  else skipAfter(s, it);
+  save();
+  log(label(it), it.status, JSON.stringify(it.result));
+  unloading = true;
+  setTimeout(() => location.reload(), 300); // the next test gets a fresh page
+}
+
+// ── the runtimes ────────────────────────────────────────────────────────────────────────────────────────────
+// Each run: load (model already downloaded), one short warm-up so shader compiles aren't counted as reading, then the
+// prompt with greedy decoding for `gen` tokens. Speeds the runtime reports itself are kept next to ours.
+const WARM = 'Hello there.';
+const now = () => performance.now();
+const per = (n, ms) => (n > 0 && ms > 0 ? +(n / (ms / 1000)).toFixed(1) : null);
+const S = (ms) => +(ms / 1000).toFixed(2);
+// Timing from a stream of tokens: first token time, and writing speed after it.
+function stopwatch() {
+  const w = { t0: now(), first: 0, last: 0, n: 0, text: '' };
+  w.token = (piece = '') => { const t = now(); if (!w.n) w.first = t; w.last = t; w.n++; w.text += piece; };
+  w.out = () => ({ firstTokenS: w.n ? S(w.first - w.t0) : null, wrote: w.n, writeTokS: w.n > 1 ? per(w.n - 1, w.last - w.first) : null, sample: w.text.slice(0, 160) });
+  return w;
+}
+
+const RUNNERS = {
+  tilde: tildeRunner(),
+  'tilde-big': tildeRunner({ chunk: BIG.chunk, maxChunk: BIG.chunk, submitBudgetMs: BIG.submitBudgetMs }),
+
+  webllm: webllmRunner(false),
+  'webllm-paced': webllmRunner(true),
+  'wllama-gpu': wllamaRunner(true),
+  'wllama-cpu': wllamaRunner(false),
+
+  transformers: {
+    async prepare(c) { await transformersLoad(c, true); },
+    async run(c) {
+      const { tf, tokenizer, model, loadS } = await transformersLoad(c, false);
+      c.stage('warm-up');
+      const warm = tokenizer(WARM);
+      await model.generate({ ...warm, max_new_tokens: 2, do_sample: false });
+      const inputs = tokenizer(c.text, { add_special_tokens: false });
+      const promptTokens = inputs.input_ids.dims.at(-1);
+      c.stage('reading');
+      const w = stopwatch();
+      const streamer = new tf.TextStreamer(tokenizer, {
+        skip_prompt: true,
+        token_callback_function: () => { if (!w.n) c.stage('writing'); w.token(); },
+        callback_function: (piece) => { w.text += piece; },
+      });
+      await model.generate({ ...inputs, max_new_tokens: c.gen, min_new_tokens: c.gen, do_sample: false, repetition_penalty: 1, streamer });
+      const o = w.out();
+      // Reading speed is estimated from the first token's time (it includes one step of writing).
+      return { loadS, promptTokens, readTokS: per(promptTokens, (w.first - w.t0)), readTokSNote: 'from first-token time', ...o };
+    },
+  },
+
+  litert: {
+    async prepare(c) {
+      // LiteRT-LM keeps its own download cache; creating the engine fills it.
+      const { lr, engine, loadS } = await litertLoad(c, 'downloading or loading');
+      c.note({ downloadAndLoadS: loadS });
+      unloading = true; await engine.delete().catch(() => {}); void lr;
+    },
+    async run(c) {
+      const { lr, engine, loadS } = await litertLoad(c, 'loading');
+      // Greedy as top-k 1: LiteRT-LM's GREEDY sampler type threw "divide by zero" in headless Chrome.
+      const greedy = { type: lr.SamplerType?.TOP_K ?? 1, k: 1, p: 1, temperature: 1 };
+      c.stage('warm-up');
+      const warm = await engine.createConversation({ sessionConfig: { samplerParams: greedy, maxOutputTokens: 2 } });
+      for await (const _ of chunksOf(warm.sendMessageStreaming(WARM))) { /* drain */ }
+      await warm.delete();
+      const conv = await engine.createConversation({ sessionConfig: { samplerParams: greedy, maxOutputTokens: c.gen } });
+      c.stage('reading');
+      const w = stopwatch();
+      for await (const chunk of chunksOf(conv.sendMessageStreaming(c.text))) {
+        const piece = (chunk.content || []).map((p) => p.text || '').join('');
+        if (!w.n) c.stage('writing');
+        w.token(piece);
+      }
+      const b = await conv.getBenchmarkInfo().catch(() => null);
+      const o = w.out();
+      return {
+        loadS, ...o, wroteChunks: o.wrote,
+        promptTokens: b?.lastPrefillTokenCount ?? null, wrote: b?.lastDecodeTokenCount ?? o.wrote,
+        readTokS: b ? +b.lastPrefillTokensPerSecond.toFixed(1) : null, readTokSNote: 'LiteRT-LM\'s own count, with the chat template',
+        writeTokS: b ? +b.lastDecodeTokensPerSecond.toFixed(1) : o.writeTokS, firstTokenS: b ? +b.timeToFirstTokenInSecond.toFixed(2) : o.firstTokenS,
+      };
+    },
+  },
+
+  dry: {
+    async prepare(c) { c.stage('downloading'); await sleep(300); },
+    async run(c) {
+      c.stage('loading'); await sleep(200);
+      if (Number(qs.get('fail')) === c.n) throw new Error('dry run: asked to fail');
+      c.stage('reading'); await sleep(200);
+      if (Number(qs.get('die')) === c.n) { await sleep(1500); fakeKill = true; location.reload(); await sleep(1e9); } // like Jetsam: no pagehide
+      c.stage('writing');
+      const w = stopwatch();
+      for (let i = 0; i < c.gen; i++) { await sleep(5); w.token('x'); }
+      return { loadS: 0.2, promptTokens: c.n, readTokS: 999, ...w.out() };
+    },
+  },
+};
+function tildeRunner(opts = {}) {
+  return {
+    async prepare(c) {
+      const kx = await import(TILDE + 'index.js');
+      const info = await kx.cachedFileInfo(GGUF_(), 'tilde-v1', { size: M().ggufBytes }).catch(() => null);
+      if (info?.complete) return c.note({ already: true });
+      c.stage('downloading');
+      const t = now();
+      await kx.cacheFile(GGUF_(), { size: M().ggufBytes, onProgress: (d, total) => c.progress(`downloading ${MB(d)} of ${MB(total)} MB`) });
+      c.note({ downloadS: S(now() - t) });
+    },
+    async run(c) {
+      const kx = await import(TILDE + 'index.js');
+      c.stage('loading');
+      let t = now();
+      const llm = await kx.Tilde.load(GGUF_(), { ctx: c.ctx, ...opts, onProgress: ({ loaded, total }) => c.progress(`loading ${MB(loaded)} of ${MB(total)} MB`) });
+      const loadS = S(now() - t);
+      c.stage('warm-up');
+      await llm.generate(WARM, { maxTokens: 2, temperature: 0, repeatPenalty: 1 });
+      const ids = llm.tokenizer.encode(c.text);
+      c.stage('reading');
+      const w = stopwatch();
+      let readMs = 0;
+      await llm.generate(ids, {
+        maxTokens: c.gen, temperature: 0, repeatPenalty: 1,
+        onRead: () => { readMs = now() - w.t0; c.stage('writing'); },
+        onToken: (p) => w.token(p),
+      });
+      const st = llm.stats();
+      if (opts.chunk) c.note({ build: `${opts.chunk}-token chunks, ${opts.submitBudgetMs / 1000} s budget` });
+      return { loadS, promptTokens: ids.length, chunkAtEnd: llm.model.chunk, readTokS: per(ids.length, readMs), ...w.out(), engineMB: st.peakMB, longestSubmitMs: st.longestSubmitMs };
+    },
+  };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// A ReadableStream as an async iterable, for browsers whose streams can't be used with for await yet.
+async function* chunksOf(stream) {
+  stream = await stream;
+  if (stream[Symbol.asyncIterator]) { yield* stream; return; }
+  const reader = stream.getReader();
+  try { for (;;) { const { done, value } = await reader.read(); if (done) return; yield value; } } finally { reader.releaseLock(); }
+}
+
+function webllmRunner(paced) {
+  const pick = (c) => (c.facts.shaderF16 ? M().mlc.f16 : M().mlc.f32);
+  // Our own builds are added to WebLLM's list; its prebuilt ones (Qwen3) are used as they ship.
+  const config = (webllm, rec, ctx) => (rec.prebuilt ? webllm.prebuiltAppConfig : { ...webllm.prebuiltAppConfig, model_list: [...webllm.prebuiltAppConfig.model_list,
+    { model_id: rec.id, model: rec.model, model_lib: rec.model_lib, overrides: { context_window_size: ctx } }] });
+  const open = async (c, stageName) => {
+    if (!navigator.gpu) throw new Error('no WebGPU in this browser');
+    const webllm = await import(`https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@${V.webllm}/+esm`);
+    const rec = pick(c);
+    c.note({ build: rec.id });
+    c.stage(stageName);
+    const t = now();
+    const engine = await webllm.CreateMLCEngine(rec.id, {
+      appConfig: config(webllm, rec, c.ctx),
+      initProgressCallback: (p) => c.progress(p.text),
+    }, { context_window_size: c.ctx });
+    return { webllm, rec, engine, loadS: S(now() - t) };
+  };
+  return {
+    async prepare(c) {
+      const webllm = await import(`https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@${V.webllm}/+esm`);
+      const rec = pick(c);
+      if (await webllm.hasModelInCache(rec.id, config(webllm, rec, c.ctx)).catch(() => false)) return c.note({ already: true });
+      const { engine, loadS } = await open(c, 'downloading or loading');
+      c.note({ downloadAndLoadS: loadS });
+      unloading = true; await engine.unload().catch(() => {});
+    },
+    async run(c) {
+      const { engine, loadS } = await open(c, 'loading');
+      if (paced && !pace(engine)) c.note({ notes: ['could not reach WebLLM\'s pipeline to pace it'] });
+      c.stage('warm-up');
+      await engine.completions.create({ prompt: WARM, max_tokens: 2, temperature: 0 });
+      c.stage('reading');
+      const w = stopwatch();
+      let usage = null;
+      const stream = await engine.completions.create({ prompt: c.text, max_tokens: c.gen, temperature: 0, ignore_eos: true, stream: true, stream_options: { include_usage: true } });
+      for await (const chunk of stream) {
+        const piece = chunk.choices?.[0]?.text;
+        if (piece) { if (!w.n) c.stage('writing'); w.token(piece); }
+        if (chunk.usage) usage = chunk.usage;
+      }
+      const x = usage?.extra || {};
+      return { loadS, promptTokens: usage?.prompt_tokens ?? null, readTokS: x.prefill_tokens_per_s ? +x.prefill_tokens_per_s.toFixed(1) : null,
+        ...w.out(), engineWriteTokS: x.decode_tokens_per_s ? +x.decode_tokens_per_s.toFixed(1) : null, paced };
+    },
+  };
+}
+// Squiggle's fix for iOS 27's GPU watchdog (squiggle app/src/engine-webllm.js paceGpu): smaller prompt pieces, each
+// finished before the next is queued, and a frame-long gap after each so the screen can draw.
+function pace(engine, chunk = 128, gap = 16) {
+  let n = 0;
+  for (const p of engine.loadedModelIdToPipeline?.values?.() || []) {
+    if (!p || typeof p.embedAndForward !== 'function') continue;
+    const forward = p.embedAndForward;
+    p.embedAndForward = async function (...args) {
+      const out = await forward.apply(this, args);
+      if (typeof this.sync === 'function') await this.sync();
+      if (gap && args[1] > 1) await sleep(gap);
+      return out;
+    };
+    if (typeof p.prefillChunkSize === 'number' && p.prefillChunkSize > chunk) p.prefillChunkSize = chunk;
+    n++;
+  }
+  return n;
+}
+
+function wllamaRunner(gpu) {
+  const BASE = `https://cdn.jsdelivr.net/npm/@wllama/wllama@${V.wllama}/esm/`;
+  const COMPAT = `https://cdn.jsdelivr.net/npm/@wllama/wllama-compat@${V.wllama}/wasm/`;
+  return {
+    async prepare(c) {
+      const lib = await import(BASE + 'index.js');
+      const cache = new lib.CacheManager();
+      // A download cut off midway stays in wllama's cache at the wrong size; only a whole file counts.
+      const have = await cache.getSize(await cache.getNameFromURL(GGUF_())).catch(() => -1);
+      if (have === M().ggufBytes) return c.note({ already: true });
+      if (have > 0) { await cache.delete(GGUF_()).catch(() => {}); c.note({ notes: [`dropped a partial download (${MB(have)} MB)`] }); }
+      c.stage('downloading');
+      const t = now();
+      await cache.download(GGUF_(), { progressCallback: ({ loaded, total }) => c.progress(`downloading ${MB(loaded)} of ${MB(total)} MB`) });
+      c.note({ downloadS: S(now() - t) });
+    },
+    async run(c) {
+      const lib = await import(BASE + 'index.js');
+      const w = new lib.Wllama({ default: BASE + 'wasm/wllama.wasm' }, { suppressNativeLog: true });
+      if (gpu && !w.isSupportWebGPU()) throw new Error('no WebGPU in this browser');
+      // wllama's own check can pick a build this browser can't compile (iOS 27.2: "Memory64 is not enabled").
+      const compat = qs.get('compat') ? qs.get('compat') === '1' : !(c.facts.jspi && c.facts.memory64);
+      if (compat) w.getWorkerResources = () => ({ wasmPath: COMPAT + 'wllama.wasm', jsPath: COMPAT + 'wllama.js', compat: true });
+      const threads = gpu ? undefined : (globalThis.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1);
+      c.note({ build: compat ? 'Safari compat build' : 'normal build', threads: threads ?? null });
+      c.stage('loading');
+      let t = now();
+      await w.loadModelFromUrl(GGUF_(), { n_ctx: c.ctx, n_gpu_layers: gpu ? 999 : 0, ...(threads ? { n_threads: threads } : {}) });
+      const loadS = S(now() - t);
+      c.stage('warm-up');
+      await w.createCompletion({ prompt: WARM, max_tokens: 2, temperature: 0 });
+      c.stage('reading + writing');
+      // Non-streaming: wllama's own timings split reading from writing exactly.
+      t = now();
+      const r = await w.createCompletion({ prompt: c.text, max_tokens: c.gen, temperature: 0, penalty_repeat: 1, ignore_eos: true });
+      const tm = r.timings || {};
+      const wallS = S(now() - t);
+      unloading = true; await w.exit().catch(() => {});
+      return { loadS, promptTokens: tm.prompt_n ?? null, readTokS: tm.prompt_per_second ? +tm.prompt_per_second.toFixed(1) : null,
+        wrote: tm.predicted_n ?? null, writeTokS: tm.predicted_per_second ? +tm.predicted_per_second.toFixed(1) : null,
+        firstTokenS: tm.prompt_ms ? S(tm.prompt_ms + (tm.predicted_per_token_ms || 0)) : null, wallS,
+        sample: (r.choices?.[0]?.text || '').slice(0, 160) };
+    },
+  };
+}
+
+async function transformersLoad(c, preparing) {
+  if (!navigator.gpu) throw new Error('no WebGPU in this browser');
+  const tf = await import(`https://cdn.jsdelivr.net/npm/@huggingface/transformers@${V.transformers}/dist/transformers.min.js`);
+  const dtype = c.facts.shaderF16 ? 'q4f16' : 'q4';
+  c.note({ build: `${ONNX_()} ${dtype}` });
+  c.stage(preparing ? 'downloading or loading' : 'loading');
+  const progress_callback = (p) => { if (p.status === 'progress_total' || p.status === 'progress') c.progress(`${p.file || 'files'} ${Math.round(p.progress || 0)}%`); };
+  const t = now();
+  const tokenizer = await tf.AutoTokenizer.from_pretrained(ONNX_(), { progress_callback });
+  const model = await tf.AutoModelForCausalLM.from_pretrained(ONNX_(), { dtype, device: 'webgpu', progress_callback });
+  const loadS = S(now() - t);
+  if (preparing) { c.note({ downloadAndLoadS: loadS }); unloading = true; await model.dispose?.(); }
+  return { tf, tokenizer, model, loadS };
+}
+
+async function litertLoad(c, stageName) {
+  if (!navigator.gpu) throw new Error('no WebGPU in this browser');
+  const lr = await import(`https://cdn.jsdelivr.net/npm/@litert-lm/core@${V.litert}/+esm`);
+  const file = M().litert(c.ctx);
+  c.note({ build: file.split('/').pop() });
+  c.stage(stageName);
+  const t = now();
+  const engine = await lr.Engine.create({ model: file, backend: lr.Backend.GPU, mainExecutorSettings: { maxNumTokens: c.ctx }, benchmarkEnabled: true });
+  return { lr, engine, loadS: S(now() - t) };
+}
+
+// ── results ─────────────────────────────────────────────────────────────────────────────────────────────────
+const OUTCOME = {
+  done: ['ok', 'ran'], died: ['bad', 'tab killed'], timeout: ['bad', 'timed out'], error: ['bad', 'error'], 'lost-gpu': ['bad', 'lost the GPU'],
+  skipped: ['warn', 'skipped'], interrupted: ['warn', 'interrupted'], pending: ['mute', 'waiting'], running: ['mute', 'running'],
+};
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
+const num = (x) => (x == null ? '–' : typeof x === 'number' ? x.toLocaleString() : x);
+function why(q) {
+  const r = q.result || {};
+  const bits = [];
+  if (q.status === 'died') bits.push(`killed during ${r.diedDuring}` + (r.gpuAtDeathMB ? ` at ${r.gpuAtDeathMB} MB of GPU buffers` : ''));
+  if (r.timeoutDuring) bits.push(`stuck ${Math.round(r.timeoutAfterS / 60)} min in ${r.timeoutDuring}`);
+  if (r.error) bits.push(`${r.errorDuring}: ${r.error}`);
+  if (r.gpuLost) bits.push(`GPU lost (${r.gpuLost.reason || '?'}${r.gpuLost.message ? ': ' + r.gpuLost.message : ''}) during ${r.gpuLost.during}`);
+  if (r.gpuError) bits.push(`GPU error: ${r.gpuError.message}`);
+  if (r.reason) bits.push(r.reason);
+  if (r.waitedForGpuS) bits.push(`waited ${r.waitedForGpuS} s for a GPU first`);
+  if (r.hidden) bits.push('page was hidden for part of it');
+  if (r.build) bits.push(r.build + (r.threads ? `, ${r.threads} thread${r.threads > 1 ? 's' : ''}` : ''));
+  if (r.engineMB) bits.push(`Tilde counted ${r.engineMB} MB` + (r.longestSubmitMs ? `, longest submit ${r.longestSubmitMs} ms` : '') + (r.chunkAtEnd ? `, chunk ${r.chunkAtEnd} at the end` : ''));
+  if (r.wrote != null && r.wrote < (q.gen || 0)) bits.push(`wrote ${r.wrote}`);
+  for (const n of r.notes || []) bits.push(n);
+  return bits.join('; ');
+}
+
+function render() {
+  const s = db.suites.find((x) => x.id === viewing) || current();
+  $('pick').innerHTML = db.suites.length > 1 ? `<label>Showing <select id="which">${db.suites.map((x) => `<option value="${x.id}" ${x === s ? 'selected' : ''}>${new Date(x.started).toLocaleString()} (${x.settings.engines.length} runtimes)</option>`).join('')}</select></label>` : '';
+  $('which')?.addEventListener('change', (e) => { viewing = e.target.value; render(); });
+  if (!s) { $('facts').textContent = 'No runs yet.'; $('table').innerHTML = ''; $('summary').innerHTML = ''; return; }
+  const f = s.facts || {};
+  // Safari freezes the iOS version in its user agent (27.x still says 18.7), so only its own version means anything.
+  $('facts').textContent = `${(MODELS[s.settings.model] || MODELS.lfm3).name} · ${f.device} ${f.safari ? 'Safari ' + f.safari : f.os} · GPU: ${[...new Set((f.adapter || 'none').split(' '))].join(' ')}${f.shaderF16 ? ' (shader-f16)' : ''} · `
+    + `${f.cores} cores · JSPI ${f.jspi ? 'yes' : 'no'}, Memory64 ${f.memory64 ? 'yes' : 'no'} · context ${s.settings.ctx}, writing ${s.settings.gen} tokens · started ${new Date(s.started).toLocaleString()}`;
+  const runs = s.queue.filter((q) => q.kind === 'run');
+  // Bars: writing speed per prompt size, a cross for a runtime that never got there.
+  let html = '';
+  for (const n of s.settings.prompts) {
+    const row = runs.filter((q) => q.prompt === n);
+    const max = Math.max(1, ...row.map((q) => q.result?.writeTokS || 0));
+    html += `<h2>${n.toLocaleString()}-token prompt: writing speed</h2><div class="bars">` + row.map((q) => {
+      const v = q.status === 'done' ? q.result.writeTokS : null;
+      const [cls, word] = OUTCOME[q.status] || ['mute', q.status];
+      return `<div>${esc(ENGINE[q.engine]?.name || q.engine)}</div><div class="track">${v ? `<div class="fill ${q.engine === 'tilde' ? 'tilde' : ''}" style="width:${(100 * v) / max}%"></div><b>${v} tok/s</b>` : `<b class="${cls}">${word === 'ran' ? 'no speed' : word}</b>`}</div>`;
+    }).join('') + '</div>';
+  }
+  $('summary').innerHTML = html;
+  const prep = s.queue.filter((q) => q.kind === 'prepare');
+  $('table').innerHTML = `<tr><th>Runtime</th><th>Prompt</th><th>Outcome</th><th>Load s</th><th>Read tok/s</th><th>Write tok/s</th><th>First token s</th><th>GPU MB</th><th>Worst frame ms</th><th>Notes</th></tr>`
+    + runs.map((q) => {
+      const r = q.result || {}; const [cls, word] = OUTCOME[q.status] || ['mute', q.status];
+      return `<tr><td>${esc(ENGINE[q.engine]?.name || q.engine)}</td><td class="n">${q.prompt}${r.promptTokens && r.promptTokens !== q.prompt ? ` (${r.promptTokens})` : ''}</td><td class="${cls}">${word}</td>`
+        + `<td class="n">${num(r.loadS)}</td><td class="n">${num(r.readTokS)}</td><td class="n">${num(r.writeTokS)}</td><td class="n">${num(r.firstTokenS)}</td>`
+        + `<td class="n">${num(r.gpuPeakMB ?? r.gpuAtDeathMB)}</td><td class="n">${num(r.worstFrameMs)}</td><td>${esc(why({ ...q, gen: s.settings.gen }))}</td></tr>`;
+    }).join('')
+    + `<tr><th colspan="10">Downloads</th></tr>` + prep.map((q) => {
+      const r = q.result || {}; const [cls, word] = OUTCOME[q.status] || ['mute', q.status];
+      const t = r.already ? 'already on this phone' : r.downloadS != null ? `downloaded in ${r.downloadS} s` : r.downloadAndLoadS != null ? `downloaded and loaded in ${r.downloadAndLoadS} s` : '';
+      return `<tr><td>${esc(ENGINE[q.engine]?.name || q.engine)}</td><td></td><td class="${cls}">${word}</td><td colspan="6">${esc(t)}</td><td>${esc(why(q))}</td></tr>`;
+    }).join('');
+}
+
+function markdown(s) {
+  if (!s) return '';
+  const f = s.facts || {};
+  const lines = [`### ${(MODELS[s.settings.model] || MODELS.lfm3).name}, ${f.device} ${f.safari ? 'Safari ' + f.safari : f.os || ''}, ${s.started.slice(0, 10)}`, '',
+    `GPU ${[...new Set((f.adapter || 'none').split(' '))].join(' ')}${f.shaderF16 ? ' (shader-f16)' : ''}; context ${s.settings.ctx}; ${s.settings.gen} tokens written, greedy; one warm-up request each. Tilde: ${s.tilde}.`, '',
+    '| Runtime | Prompt | Outcome | Load s | Read tok/s | Write tok/s | First token s | GPU MB | Worst frame ms | Notes |', '|---|---:|---|---:|---:|---:|---:|---:|---:|---|'];
+  for (const q of s.queue.filter((x) => x.kind === 'run')) {
+    const r = q.result || {};
+    lines.push(`| ${ENGINE[q.engine]?.name || q.engine} | ${q.prompt} | ${(OUTCOME[q.status] || [, q.status])[1]} | ${num(r.loadS)} | ${num(r.readTokS)} | ${num(r.writeTokS)} | ${num(r.firstTokenS)} | ${num(r.gpuPeakMB ?? r.gpuAtDeathMB)} | ${num(r.worstFrameMs)} | ${why({ ...q, gen: s.settings.gen }).replace(/\|/g, '/')} |`);
+  }
+  return lines.join('\n');
+}
+
+// ── keeping the screen on ──────────────────────────────────────────────────────────────────────────────────
+// A locked phone stops the run (Safari is suspended). Safari only grants a wake lock after a tap, and every test is a
+// new page, so the bar shows a button whenever the lock isn't held; tapping anywhere on the page takes it too.
+let wake = null;
+async function keepAwake() {
+  if (!navigator.wakeLock || document.hidden || (wake && !wake.released)) return showAwake();
+  try { wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', showAwake); } catch {}
+  showAwake();
+}
+function showAwake() {
+  const s = current();
+  $('awake').hidden = !navigator.wakeLock || !!(wake && !wake.released) || !s || !!s.ended || !!s.stopped;
+}
+$('awake').onclick = keepAwake;
+addEventListener('pointerdown', keepAwake);
+document.addEventListener('visibilitychange', keepAwake);
+
+// ── wiring ──────────────────────────────────────────────────────────────────────────────────────────────────
+fillForm();
+$('start').onclick = () => {
+  const s = current();
+  if (s && !s.ended && s.queue.some((q) => q.status === 'pending') && !confirm('A run is still going. Start a new one instead?')) return;
+  if (s && !s.ended) { s.stopped = true; s.ended = new Date().toISOString(); save(); }
+  clearTimeout(timer);
+  startSuite(settingsFromForm());
+};
+$('stop').onclick = () => {
+  const s = current(); if (!s) return;
+  s.stopped = true;
+  clearTimeout(timer);
+  const running = s.queue.find((q) => q.status === 'running');
+  if (running) { running.status = 'pending'; running.attempts--; save(); location.reload(); return; } // not a crash
+  save(); advance(s);
+};
+$('resume').onclick = () => { const s = current(); if (!s) return; s.stopped = false; save(); advance(s); };
+$('wipe').onclick = async () => {
+  if (!confirm('Delete every model this page downloaded (all runtimes)? Results are kept.')) return;
+  for (const k of await caches.keys()) await caches.delete(k);
+  try { const root = await navigator.storage.getDirectory(); for await (const [name] of root.entries()) await root.removeEntry(name, { recursive: true }); } catch {}
+  status('Downloaded models deleted.');
+};
+$('md').onclick = async () => { try { await navigator.clipboard.writeText(markdown(db.suites.find((x) => x.id === viewing) || current())); status('Copied.'); } catch (e) { status('Copy failed: ' + e.message); } };
+$('share').onclick = async () => { const text = markdown(db.suites.find((x) => x.id === viewing) || current()); try { await navigator.share({ title: 'Tilde vs the others', text }); } catch { try { await navigator.clipboard.writeText(text); status('Copied (sharing not available).'); } catch {} } };
+$('json').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(db, null, 1)], { type: 'application/json' }));
+  a.download = `tilde-compare-${new Date().toISOString().slice(0, 16).replace(':', '')}.json`;
+  a.click();
+};
+window.__bench = { get db() { return db; }, suite: () => current(), markdown: () => markdown(current()) };
+
+const s = current();
+if (s && !s.ended) settle(s);
+render();
+if (s && !s.ended) advance(s);
+else if (qs.get('run') === '1') startSuite(settingsFromForm());
+else status(s ? 'Last run finished. Start another below.' : 'Pick runtimes and press Start.');
+keepAwake();
+</script>

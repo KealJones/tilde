@@ -1,0 +1,82 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Tilde: LFM3 speech vs llama.cpp</title>
+<pre id="log"></pre>
+<script type="module">
+// Compares the speech path with tts_dump (llama.cpp, codebook order 0..11, greedy codes):
+// hidden state after the TTS prompt, the 3 depthformer passes of frame 0, its feedback embedding, the codes of the
+// first ?frames frames, and the codec's PCM for the reference codes.
+import { openGpu } from '../src/gpu.js';
+import { httpSource, readGGUF } from '../src/gguf.js';
+import { LFM3 } from '../src/models/lfm3.js';
+import { LFM3SpeechGen } from '../src/models/lfm3gen.js';
+import { Istft } from '../src/speech.js';
+
+const qs = new URLSearchParams(location.search);
+const log = (...a) => { const s = a.join(' '); document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const cosine = (a, b) => { let d = 0, x = 0, y = 0; for (let i = 0; i < a.length; i++) { d += a[i] * b[i]; x += a[i] * a[i]; y += b[i] * b[i]; } return d / Math.sqrt(x * y); };
+const PROMPT = [124894, 124899, 23630, 207, 116068, 336, 9754, 296, 1972, 3478, 1492, 267, 6672, 7902, 22, 124900, 207, 124899, 5922, 207, 35808, 487, 4943, 490, 23013, 22, 124900, 207, 124899, 63514, 207, 124901, 124902, 125012];
+const argmax = (l, o, n) => { let b = 0; for (let i = 1; i < n; i++) if (l[o + i] > l[o + b]) b = i; return b; };
+
+try {
+  const b = await (await fetch(qs.get('ref') || '/ref/tts.bin')).arrayBuffer();
+  const dv = new DataView(b); let p = 0;
+  const F = dv.getInt32(0, true); p = 4;
+  const refCodes = new Int32Array(b.slice(p, p + F * 48)); p += F * 48;
+  const V = 2017;
+  const h0 = new Float32Array(b.slice(p, p + 2048 * 4)); p += 2048 * 4;
+  const lg0 = new Float32Array(b.slice(p, p + 3 * 12 * V * 4)); p += 3 * 12 * V * 4;
+  const fb0 = new Float32Array(b.slice(p, p + 2048 * 4)); p += 2048 * 4;
+  const ns = dv.getInt32(p, true); p += 4;
+  const refPcm = new Float32Array(b.slice(p, p + ns * 4));
+  log('reference:', F, 'frames,', ns, 'samples');
+
+  const gpu = await openGpu();
+  const mmSrc = httpSource('/models/mmproj-LFM3-Omni-2B-Q8_0.gguf');
+  const mm = await readGGUF(mmSrc);
+  const gen = await LFM3SpeechGen.load(gpu, mmSrc, mm);
+  log('speech generator loaded', JSON.stringify(gpu.report()));
+
+  // Codec first (independent of the backbone): decode the reference codes.
+  gen.resetCodec();
+  const ist = new Istft();
+  const parts = [];
+  let t0 = performance.now();
+  for (let f = 0; f < F; f++) {
+    const st = await gen.decodeFrame([...refCodes.subarray(f * 12, f * 12 + 12)]);
+    for (let s = 0; s < 6; s++) parts.push(ist.frame(st, s * 1282));
+  }
+  parts.push(ist.flush());
+  const pcm = new Float32Array(parts.reduce((s, x) => s + x.length, 0));
+  { let o = 0; for (const x of parts) { pcm.set(x, o); o += x.length; } }
+  log('codec:', F, 'frames in', ((performance.now() - t0) / 1000).toFixed(1), 's →', pcm.length, 'samples (ref', ns + ')', 'cosine', cosine(pcm.subarray(0, Math.min(ns, pcm.length)), refPcm.subarray(0, Math.min(ns, pcm.length))).toFixed(5));
+  let ok = pcm.length === ns && cosine(pcm, refPcm) > 0.99;
+
+  if (qs.get('backbone') !== '0') {
+    const m = await LFM3.load(gpu, httpSource('/models/LFM3-Omni-2B-Q4_0.gguf'), { ctx: 256, chunk: 64 });
+    await m.forward(PROMPT);
+    const h = new Float32Array(await gpu.read(m.a.headIn, 2048 * 4));
+    log('hidden state cosine', cosine(h, h0).toFixed(6));
+    const nFrames = Number(qs.get('frames') || 2);
+    let codesOk = true;
+    for (let f = 0; f < nFrames; f++) {
+      const codes = new Array(12).fill(-1);
+      let k = 0;
+      for (let pass = 0; pass < 3; pass++) {
+        const l = await gen.codeLogits(m.a.headIn, codes);
+        if (f === 0) log(`frame 0 pass ${pass}: logits cosine`, cosine(l, lg0.subarray(pass * 12 * V, (pass + 1) * 12 * V)).toFixed(6));
+        for (let j = 0; j < 4; j++, k++) codes[k] = argmax(l, k * V, V);
+      }
+      const want = [...refCodes.subarray(f * 12, f * 12 + 12)];
+      const same = codes.every((c, i) => c === want[i]);
+      codesOk = codesOk && same;
+      log(`frame ${f} codes`, codes.join(' '), same ? 'MATCH' : 'ref ' + want.join(' '));
+      const fb = await gen.feedback(codes);
+      if (f === 0) log('feedback cosine', cosine(new Float32Array(await gpu.read(fb, 2048 * 4)), fb0).toFixed(6));
+      await m.forwardEmbeds(fb, 0, 1);
+    }
+    ok = ok && codesOk;
+  }
+  window.__result = { ok };
+} catch (e) { log('ERROR', e.stack || e); window.__result = { ok: false }; }
+</script>

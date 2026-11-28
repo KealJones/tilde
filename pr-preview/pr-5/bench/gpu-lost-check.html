@@ -1,0 +1,18 @@
+<!doctype html><meta charset="utf-8"><pre id="log"></pre>
+<!-- Checks that a lost GPU device makes run(), read() and done() throw at once instead of hanging (WebKit never
+     settles onSubmittedWorkDone or mapAsync after its watchdog takes the device). npm run gpu-test -- gpu-lost-check.html -->
+<script type="module">
+import { openGpu } from '../src/gpu.js';
+const log = (...a) => { document.getElementById('log').textContent += a.join(' ') + '\n'; console.log(a.join(' ')); };
+const gpu = await openGpu();
+const t0 = performance.now();
+gpu.device.destroy();
+const tries = [['run', () => gpu.run(() => {})], ['read', () => gpu.read(gpu.buffer(16), 16)], ['done', () => gpu.done()]];
+let ok = true;
+for (const [name, f] of tries) {
+  try { await Promise.race([f(), new Promise((_, rej) => setTimeout(() => rej(new Error('HUNG')), 5000))]); log(name, 'resolved (unexpected)'); ok = false; }
+  catch (e) { log(name, '->', e.message, `${Math.round(performance.now() - t0)} ms`); if (/HUNG/.test(e.message)) ok = false; }
+}
+window.__result = { ok };
+log(ok ? 'ALL OK' : 'FAIL');
+</script>
