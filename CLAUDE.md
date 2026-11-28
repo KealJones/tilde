@@ -10,7 +10,8 @@ GPU; ~3 s per GPU command buffer). Read docs/design.md first; it is the contract
 - Every GPU buffer goes through the engine's allocator so memory is counted.
 - GPU only. No CPU fallback path.
 - Kernels must not need `shader-f16`: store halves in u32 and use `unpack2x16float`.
-- Model-specific code lives in one file per architecture (src/models/<arch>.js).
+- Model-specific code lives in one file per architecture (src/models/<arch>.js). Language models extend `Decoder`
+  (src/models/decoder.js) and only list each layer's modules; a new layer kind goes in decoder.js as a module.
 - Every kernel change is checked against the CPU reference (src/quant.js, src/ref/) and, for whole-model changes,
   against llama.cpp logits for the same tokens.
 

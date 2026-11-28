@@ -17,7 +17,7 @@ JavaScript, WebAssembly and the GPU; ~3 s per GPU command buffer).
 A GGUF holds the weights, a few settings and the tokenizer. It doesn't say how to run them: that LFM3's 24 layers
 are 13 short convolutions, 5 windowed attention and 6 full attention, where the norms sit, or which gate goes where.
 Every engine that reads GGUFs keeps that recipe as code, one file per architecture: llama.cpp has `lfm3.cpp`, Tilde
-has [`src/models/lfm3.js`](../src/models/lfm3.js). ONNX is the exception: it ships the whole computation as a graph,
+has [`src/models/lfm3.js`](../src/models/lfm3.js), a table of which modules each layer runs. ONNX is the exception: it ships the whole computation as a graph,
 so any ONNX runner can run any model, at the price of running it generically.
 
 ## wllama: the recipe is there, the stack underneath isn't
