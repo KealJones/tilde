@@ -168,7 +168,9 @@ HTTPS).
   and `ClipPlayer` plays the clips back to back.
 
 Model code lives in one file per architecture (`src/models/`), picked from the GGUF's `general.architecture` and
-imported only when a model of that kind loads, so adding another costs pages that don't use it nothing.
+imported only when a model of that kind loads, so adding another costs pages that don't use it nothing. The language
+models share one runtime (`src/models/decoder.js`); their files only list what each layer runs, e.g. Qwen3's
+`norm attn_norm, attention, add, norm ffn_norm, swiglu, add`.
 
 ## How it's checked
 

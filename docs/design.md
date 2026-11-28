@@ -34,8 +34,10 @@ frames does not buy memory.
    the Cache API ignores `#fragments` when matching, so fragment-keyed pieces would all collide.
 6. **GPU only.** No CPU fallback: a 1.7B model on a phone CPU takes minutes to answer "hi".
 7. **No build step.** Plain ES modules with JSDoc types, served as-is (GitHub Pages works). Model-specific code
-   lives in one file per architecture (LFM3, Qwen3), imported on demand by the GGUF's `general.architecture`; the
-   attention kernels take the head counts as parameters, so a new GQA model reuses them.
+   lives in one file per architecture (LFM3, Qwen3), imported on demand by the GGUF's `general.architecture`. The
+   language models share `src/models/decoder.js` (loading, KV and conv state, submit sizing, the layer loop) and each
+   file lists the modules its layers run (`norm`, `attention`, `shortconv`, `swiglu`, `add`, `add_norm`); the
+   attention kernels take the head counts as parameters, so a new GQA model is mostly a new table.
 
 ## Model input
 
